@@ -2,131 +2,131 @@
 
 **Solar storage (Deye hybrid inverter) and EV charging management (Wallbox Pulsar Max)**
 
-Script Python tournant sur une Raspberry Pi, pilotant la charge EV et la batterie Deye via l'API Home Assistant.
+Python script running on a Raspberry Pi, managing EV charging and Deye battery via the Home Assistant REST API.
 
 ---
 
-## Table des matières
+## Table of Contents
 
-1. [Objectif](#objectif)
-2. [Entités Home Assistant](#entités-home-assistant)
-3. [Conventions de signe](#conventions-de-signe)
-4. [Architecture logicielle](#architecture-logicielle)
-5. [Machine à états](#machine-à-états)
-6. [Logique détaillée par état](#logique-détaillée-par-état)
-7. [Algorithmes](#algorithmes)
-8. [Fichiers du projet](#fichiers-du-projet)
+1. [Goal](#goal)
+2. [Home Assistant Entities](#home-assistant-entities)
+3. [Sign Conventions](#sign-conventions)
+4. [Software Architecture](#software-architecture)
+5. [State Machine](#state-machine)
+6. [Detailed State Logic](#detailed-state-logic)
+7. [Algorithms](#algorithms)
+8. [Project Files](#project-files)
 9. [Configuration](#configuration)
-10. [Installation & exécution](#installation--exécution)
+10. [Installation & Running](#installation--running)
 
 ---
 
-## Objectif
+## Goal
 
-Le Deye (onduleur hybride + batterie) équilibre naturellement la consommation de la maison en déchargeant sa batterie pour maintenir `grid_power ≈ 0`. Problème : lorsqu'un véhicule électrique (EV) est branché, le Deye le considère comme un consommateur lambda et vide la batterie pour l'alimenter.
+The Deye (hybrid inverter + battery) naturally balances household consumption by discharging its battery to keep `grid_power ≈ 0`. Problem: when an electric vehicle (EV) is plugged in, the Deye treats it as a regular load and drains the battery to power it.
 
-Ce script a deux missions :
+This script has two missions:
 
-1. **Protéger la batterie** — quand l'EV charge, empêcher la batterie de se décharger pour l'EV. Seule la maison est alimentée par la batterie ; l'EV est alimenté par le grid (et/ou le surplus solaire).
-2. **Piloter la charge EV avec le surplus solaire** — quand la batterie a atteint son seuil cible (`batt_charge_limit`), moduler le courant de la wallbox pour consommer le surplus solaire, sans tirer sur le grid ni décharger la batterie.
+1. **Protect the battery** — when the EV is charging, prevent the battery from discharging for the EV. Only the house is powered by the battery; the EV is powered by the grid (and/or solar surplus).
+2. **Drive EV charging with solar surplus** — once the battery has reached its target SOC (`batt_charge_limit`), modulate the wallbox current to consume the solar surplus, without drawing from the grid or discharging the battery.
 
 ---
 
-## Entités Home Assistant
+## Home Assistant Entities
 
-### Capteurs (lecture seule)
+### Sensors (read-only)
 
-| Entité | Description | Plage |
+| Entity | Description | Range |
 |--------|-------------|-------|
-| `sensor.deye_battery` | State of Charge (SOC) batterie | 0 – 100 % |
-| `sensor.deye_battery_voltage` | Tension batterie | ~50 – 58 V |
-| `sensor.deye_battery_power` | Puissance batterie (+ décharge, − charge) | W |
-| `sensor.deye_grid_power` | Puissance grid (+ import, − export) | W |
-| `sensor.deye_microinverter_power` | Production solaire (micro-onduleurs) | 0 – 5000 W |
-| `sensor.deye_load_l1_voltage` | Tension réseau maison | ~230 V |
-| `sensor.shellyem_34945478aee1_channel_2_power` | Puissance charge EV (mesure Shelly) | 0 – 7500 W |
+| `sensor.deye_battery` | Battery State of Charge (SOC) | 0 – 100 % |
+| `sensor.deye_battery_voltage` | Battery voltage | ~50 – 58 V |
+| `sensor.deye_battery_power` | Battery power (+ discharge, − charge) | W |
+| `sensor.deye_grid_power` | Grid power (+ import, − export) | W |
+| `sensor.deye_microinverter_power` | Solar production (micro-inverters) | 0 – 5000 W |
+| `sensor.deye_load_l1_voltage` | House grid voltage | ~230 V |
+| `sensor.shellyem_34945478aee1_channel_2_power` | EV charging power (Shelly meter) | 0 – 7500 W |
 
-### Actionneurs (écriture)
+### Actuators (write)
 
-| Entité | Description | Plage |
+| Entity | Description | Range |
 |--------|-------------|-------|
-| `number.deye_battery_max_charging_current` | Courant max charge batterie | 0 – 100 A |
-| `number.deye_battery_max_discharging_current` | Courant max décharge batterie | 0 – 100 A |
-| `number.wallbox_pulsar_max_sn_429953_maximum_charging_current` | Courant max charge wallbox | 6 – 32 A |
+| `number.deye_battery_max_charging_current` | Max battery charging current | 0 – 100 A |
+| `number.deye_battery_max_discharging_current` | Max battery discharging current | 0 – 100 A |
+| `number.wallbox_pulsar_max_sn_429953_maximum_charging_current` | Max wallbox charging current | 6 – 32 A |
 
-### Variables utilisateur (à créer dans HA)
+### User Variables (to create in HA)
 
-| Entité | Description | Plage conseillée | Défaut |
-|--------|-------------|------------------|--------|
-| `input_number.batt_charge_limit` | SOC cible batterie avant activation surplus | 50 – 100 % | 80 % |
-
----
-
-## Conventions de signe
-
-```
-sensor.deye_battery_power :  + = décharge (batterie → maison)
-                              − = charge   (solaire → batterie)
-
-sensor.deye_grid_power :     + = import   (grid → maison, on paie)
-                              − = export   (maison → grid, on injecte)
-```
+| Entity | Description | Suggested range | Default |
+|--------|-------------|-----------------|---------|
+| `input_number.batt_charge_limit` | Target battery SOC before surplus activation | 50 – 100 % | 80 % |
 
 ---
 
-## Architecture logicielle
+## Sign Conventions
 
-### Interface unique via Home Assistant
+```
+sensor.deye_battery_power :  + = discharge (battery → house)
+                              − = charge   (solar → battery)
 
-Toutes les lectures de capteurs et les écritures d'actionneurs passent par l'**API REST de Home Assistant**. Pas d'accès direct Modbus ni cloud Wallbox.
-
-**Raisons :**
-- Évite les conflits Modbus (un seul maître Modbus autorisé ; HA l'occupe déjà)
-- La lib Python Wallbox passe par le cloud (latence, dépendance internet)
-- Un seul point d'authentification (token HA)
-- Pas de dépendance réseau externe
-
-### Boucle de contrôle
-
-- **Boucle rapide (~1 s)** : lecture des capteurs + évaluation de la machine à états + calcul du courant max de décharge (uniquement en EV_NO_SOLAR). Écriture vers HA **seulement quand la valeur change** pour ne pas marteler le bus Modbus inutilement.
-- **Boucle lente (~60 s)** : ajustement du courant wallbox en mode EV_SURPLUS
+sensor.deye_grid_power :     + = import   (grid → house, you pay)
+                              − = export   (house → grid, you inject)
+```
 
 ---
 
-## Machine à états
+## Software Architecture
 
-Le script fonctionne comme une **machine à états unique** — pas de mode "jour/nuit" explicite. Le seuil de production solaire (100 W) détermine naturellement les transitions.
+### Single Interface via Home Assistant
+
+All sensor reads and actuator writes go through the **Home Assistant REST API**. No direct Modbus access or Wallbox cloud.
+
+**Reasons:**
+- Avoids Modbus conflicts (only one Modbus master allowed; HA already occupies it)
+- The Python Wallbox library goes through the cloud (latency, internet dependency)
+- Single authentication point (HA token)
+- No external network dependency
+
+### Control Loops
+
+- **Fast loop (~1 s)**: read sensors + evaluate state machine + compute max discharge current (only in EV_NO_SOLAR). Writes to HA **only when the value changes** to avoid hammering the Modbus bus.
+- **Slow loop (~60 s)**: adjust wallbox current in EV_SURPLUS mode
+
+---
+
+## State Machine
+
+The script runs as a **single state machine** — no explicit "day/night" mode. The solar production threshold (100 W) naturally determines transitions.
 
 ```
-                    EV débranchée
+                    EV unplugged
                    ┌────────────┐
                    │            │
                    │   IDLE     │
                    │            │
                    └─────┬──────┘
-                         │ EV branchée (Shelly > 40 W)
+                         │ EV plugged in (Shelly > 40 W)
                          ▼
               ┌─────────────────────┐
-              │  Solaire > 100 W ?  │
+              │  Solar > 100 W ?    │
               └──┬──────────────┬───┘
-                 │ Non          │ Oui
+                 │ No           │ Yes
                  ▼              ▼
     ┌────────────────┐  ┌───────────────────────┐
     │  EV_NO_SOLAR   │  │  SOC < batt_charge_   │
     │                │  │  limit ?               │
-    │  Bride décharge│  └──┬────────────────┬────┘
-    │  batterie      │     │ Oui            │ Non
-    │  (house-only)  │     ▼                ▼
-    │                │  ┌──────────────┐ ┌──────────────┐
-    │  Ne touche PAS │  │ EV_BATTERY_  │ │ EV_SURPLUS   │
-    │  au courant    │  │ PRIORITY     │ │              │
-    │  wallbox       │  │              │ │ Stop charge  │
-    └────────────────┘  │ Wallbox = 6A │ │ batterie     │
-                        │ Charge batt  │ │ Pilote       │
-                        │ libre        │ │ wallbox avec │
-                        │ Décharge     │ │ surplus      │
-                        │ libre (100A) │ │ Décharge     │
-                        │              │ │ libre (100A) │
+    │  Throttle      │  └──┬────────────────┬────┘
+    │  battery       │     │ Yes            │ No
+    │  discharge     │     ▼                ▼
+    │  (house-only)  │  ┌──────────────┐ ┌──────────────┐
+    │                │  │ EV_BATTERY_  │ │ EV_SURPLUS   │
+    │  Does NOT      │  │ PRIORITY     │ │              │
+    │  touch wallbox │  │              │ │ Stop battery │
+    │  current       │  │ Wallbox = 6A │ │ charging     │
+    └────────────────┘  │ Free battery │ │ Drive wallbox│
+                        │ charge       │ │ with surplus │
+                        │ Free         │ │ Free         │
+                        │ discharge    │ │ discharge    │
+                        │ (100A)       │ │ (100A)       │
                         └──────┬───────┘ └──────┬───────┘
                                │                │
                                │  SOC ≥ limit   │
@@ -134,19 +134,19 @@ Le script fonctionne comme une **machine à états unique** — pas de mode "jou
                                │                │
                                │◄───────────────│
                                │ SOC < limit-5% │
-                               │ (hystérésis)   │
+                               │ (hysteresis)   │
 ```
 
 ### Transitions
 
-| De → Vers | Condition |
+| From → To | Condition |
 |-----------|-----------|
-| **IDLE → EV_NO_SOLAR** | Shelly > 40 W ET microinverter ≤ 100 W |
-| **IDLE → EV_BATTERY_PRIORITY** | Shelly > 40 W ET microinverter > 100 W ET SOC < `batt_charge_limit` |
-| **IDLE → EV_SURPLUS** | Shelly > 40 W ET microinverter > 100 W ET SOC ≥ `batt_charge_limit` |
+| **IDLE → EV_NO_SOLAR** | Shelly > 40 W AND microinverter ≤ 100 W |
+| **IDLE → EV_BATTERY_PRIORITY** | Shelly > 40 W AND microinverter > 100 W AND SOC < `batt_charge_limit` |
+| **IDLE → EV_SURPLUS** | Shelly > 40 W AND microinverter > 100 W AND SOC ≥ `batt_charge_limit` |
 | **EV_NO_SOLAR → IDLE** | Shelly ≤ 40 W |
-| **EV_NO_SOLAR → EV_BATTERY_PRIORITY** | microinverter > 100 W ET SOC < `batt_charge_limit` |
-| **EV_NO_SOLAR → EV_SURPLUS** | microinverter > 100 W ET SOC ≥ `batt_charge_limit` |
+| **EV_NO_SOLAR → EV_BATTERY_PRIORITY** | microinverter > 100 W AND SOC < `batt_charge_limit` |
+| **EV_NO_SOLAR → EV_SURPLUS** | microinverter > 100 W AND SOC ≥ `batt_charge_limit` |
 | **EV_BATTERY_PRIORITY → IDLE** | Shelly ≤ 40 W |
 | **EV_BATTERY_PRIORITY → EV_NO_SOLAR** | microinverter ≤ 100 W (+ wallbox → 6 A) |
 | **EV_BATTERY_PRIORITY → EV_SURPLUS** | SOC ≥ `batt_charge_limit` |
@@ -156,123 +156,123 @@ Le script fonctionne comme une **machine à états unique** — pas de mode "jou
 
 ---
 
-## Logique détaillée par état
+## Detailed State Logic
 
-### État IDLE (EV non branchée)
+### IDLE State (EV not plugged in)
 
-- **Déclencheur** : `shellyem_power ≤ 40 W`
-- **Actions à l'entrée** :
+- **Trigger**: `shellyem_power ≤ 40 W`
+- **Entry actions**:
   - `deye_battery_max_discharging_current` → 100 A
   - `deye_battery_max_charging_current` → 100 A
-- **Le script ne touche PAS au courant wallbox** (l'utilisateur gère start/stop manuellement)
-- **Comportement** : le Deye fonctionne avec son propre algorithme d'équilibrage. Aucune intervention.
+- **Does NOT touch wallbox current** (user manages start/stop manually)
+- **Behavior**: the Deye runs its own balancing algorithm. No intervention.
 
-### État EV_NO_SOLAR (EV branchée, pas de solaire)
+### EV_NO_SOLAR State (EV plugged in, no solar)
 
-- **Déclencheur** : `shellyem_power > 40 W` ET `microinverter_power ≤ 100 W`
-- **Actions à l'entrée** :
-  - `deye_battery_max_charging_current` → 100 A (charge batterie possible si grid le permet)
-- **Boucle rapide (1 s)** : calcule et applique `deye_battery_max_discharging_current` → courant house-only (voir [Algorithme de limitation décharge](#algorithme-de-limitation-de-décharge)). Écriture uniquement quand la valeur arrondie change.
-- **Ne touche PAS au courant wallbox** : la nuit, le grid alimente l'EV. L'utilisateur contrôle le courant wallbox manuellement.
-- **Résultat** : la batterie alimente uniquement la maison. Le grid couvre l'EV.
+- **Trigger**: `shellyem_power > 40 W` AND `microinverter_power ≤ 100 W`
+- **Entry actions**:
+  - `deye_battery_max_charging_current` → 100 A (battery charging allowed if grid permits)
+- **Fast loop (1 s)**: computes and applies `deye_battery_max_discharging_current` → house-only current (see [Discharge Limitation Algorithm](#discharge-limitation-algorithm)). Writes only when the rounded value changes.
+- **Does NOT touch wallbox current**: at night, the grid powers the EV. The user controls wallbox current manually.
+- **Result**: battery powers only the house. Grid covers the EV.
 
-### État EV_BATTERY_PRIORITY (solaire disponible, batterie en charge)
+### EV_BATTERY_PRIORITY State (solar available, battery charging)
 
-- **Déclencheur** : `shellyem_power > 40 W` ET `microinverter_power > 100 W` ET `SOC < batt_charge_limit`
-- **Actions à l'entrée** :
+- **Trigger**: `shellyem_power > 40 W` AND `microinverter_power > 100 W` AND `SOC < batt_charge_limit`
+- **Entry actions**:
   - `deye_battery_max_charging_current` → 100 A
-  - `deye_battery_max_discharging_current` → 100 A (le Deye gère librement, le soleil couvre les besoins)
-  - `wallbox_max_current` → 6 A (minimum, pour laisser le solaire charger la batterie)
-- **Pas de limitation de décharge** : le soleil brille suffisamment, la batterie ne se décharge pas naturellement. Pas besoin de brider. Si un transitoire fait brièvement décharger la batterie, c'est le comportement normal et souhaité du Deye.
-- **Comportement** : le Deye utilise le surplus solaire pour charger la batterie (son propre algo). La wallbox reste au minimum (6 A ≈ 1,4 kW monophasé, couvert par le grid).
-- **Transition** : quand `SOC ≥ batt_charge_limit` → passage en EV_SURPLUS
+  - `deye_battery_max_discharging_current` → 100 A (Deye manages freely, sun covers demand)
+  - `wallbox_max_current` → 6 A (minimum, to let solar charge the battery)
+- **No discharge limitation**: the sun provides enough energy, the battery doesn't naturally discharge. No need to throttle. If a transient briefly discharges the battery, that's normal and desired Deye behavior.
+- **Behavior**: the Deye uses solar surplus to charge the battery (its own algorithm). The wallbox stays at minimum (6 A ≈ 1.4 kW single-phase, covered by grid).
+- **Transition**: when `SOC ≥ batt_charge_limit` → switch to EV_SURPLUS
 
-### État EV_SURPLUS (surplus solaire → charge EV)
+### EV_SURPLUS State (solar surplus → EV charging)
 
-- **Déclencheur** : `SOC ≥ batt_charge_limit` (ou retour en surplus après hystérésis)
-- **Actions à l'entrée** :
-  - `deye_battery_max_charging_current` → 0 A (stop charge batterie, toute la production solaire est disponible)
-  - `deye_battery_max_discharging_current` → 100 A (le Deye gère librement les transitoires)
-- **Pas de limitation de décharge** : le soleil couvre la maison. La batterie peut brièvement se décharger pour couvrir un pic de consommation (comportement normal du Deye). Notre script ajustera la wallbox à la minute suivante pour compenser.
-- **Boucle lente (60 s)** : ajustement du courant wallbox via l'[Algorithme de pilotage surplus](#algorithme-de-pilotage-surplus)
-- **Hystérésis** : si `SOC < (batt_charge_limit − 5)` :
+- **Trigger**: `SOC ≥ batt_charge_limit` (or return to surplus after hysteresis)
+- **Entry actions**:
+  - `deye_battery_max_charging_current` → 0 A (stop battery charging, all solar production is available)
+  - `deye_battery_max_discharging_current` → 100 A (Deye freely handles transients)
+- **No discharge limitation**: the sun covers the house. The battery may briefly discharge to cover a consumption spike (normal Deye behavior). Our script will adjust the wallbox at the next minute to compensate.
+- **Slow loop (60 s)**: adjust wallbox current via the [Surplus Steering Algorithm](#surplus-steering-algorithm)
+- **Hysteresis**: if `SOC < (batt_charge_limit − 5)`:
   - `wallbox_max_current` → 6 A
   - `deye_battery_max_charging_current` → 100 A
-  - Transition vers EV_BATTERY_PRIORITY
+  - Transition to EV_BATTERY_PRIORITY
 
 ---
 
-## Algorithmes
+## Algorithms
 
-### Algorithme de limitation de décharge
+### Discharge Limitation Algorithm
 
-**Objectif** : la batterie ne se décharge que pour alimenter la maison, pas l'EV.
+**Goal**: the battery only discharges to power the house, not the EV.
 
-**Bilan de puissance** (conservation de l'énergie) :
+**Power balance** (energy conservation):
 
 ```
 microinverter + battery_power + grid_power = house_load + ev_power
 ```
 
-D'où :
+Therefore:
 
 ```
 house_load = microinverter + battery_power + grid_power − ev_power
 ```
 
-Le courant de décharge maximum autorisé :
+Maximum allowed discharge current:
 
 ```
 desired_discharge_A = max(house_load, 0) / battery_voltage + MARGIN
 desired_discharge_A = clamp(desired_discharge_A, 0, 100)
 ```
 
-- `MARGIN` : marge de sécurité de +1 A pour éviter les oscillations
-- Lissage par moyenne mobile exponentielle (EMA) pour stabiliser la consigne :
-  `smoothed = α × new_value + (1 − α) × previous_smoothed` avec `α ≈ 0.3`
-- Calculé toutes les **1 seconde**, mais écriture vers HA **uniquement quand la valeur arrondie (entier) change** par rapport à la dernière écrite
-- **Actif uniquement en état EV_NO_SOLAR** — dans les états solaires, le décharge est laissée à 100 A (le soleil couvre les besoins)
-- Le calcul de `house_load` est valide même si le courant de décharge est déjà bridé (les mesures reflètent l'état réel du système)
+- `MARGIN`: safety margin of +1 A to avoid oscillations
+- Smoothing via exponential moving average (EMA) to stabilize the setpoint:
+  `smoothed = α × new_value + (1 − α) × previous_smoothed` with `α ≈ 0.3`
+- Computed every **1 second**, but writes to HA **only when the rounded integer value changes** compared to the last written value
+- **Active only in EV_NO_SOLAR state** — in solar states, discharge is left at 100 A (sun covers demand)
+- The `house_load` calculation is valid even if discharge current is already throttled (measurements reflect actual system state)
 
-### Algorithme de pilotage surplus
+### Surplus Steering Algorithm
 
-**Objectif** : ajuster le courant wallbox pour que `grid ≈ 0` ET `battery_power ≈ 0`.
+**Goal**: adjust wallbox current so that `grid ≈ 0` AND `battery_power ≈ 0`.
 
-En mode surplus, `max_charging_current = 0`, donc la batterie ne se charge pas. On veut que **tout le surplus solaire aille dans l'EV**.
+In surplus mode, `max_charging_current = 0`, so the battery isn't charging. We want **all solar surplus to go to the EV**.
 
-**Calcul du nouveau courant wallbox** :
+**New wallbox current calculation**:
 
 ```
-surplus_disponible = ev_power_actuelle − grid_power − battery_power
-wallbox_current_new = surplus_disponible / grid_voltage
+available_surplus = ev_power_actual − grid_power − battery_power
+wallbox_current_new = available_surplus / grid_voltage
 wallbox_current_new = clamp(round(wallbox_current_new), 6, 32)
 ```
 
-Explication :
-- Si `grid_power > 0` (import) → on consomme trop → on réduit wallbox
-- Si `grid_power < 0` (export) → surplus inutilisé → on augmente wallbox
-- Si `battery_power > 0` (décharge) → la batterie aide l'EV/maison → on réduit wallbox
-- Si `battery_power < 0` (charge) → ne devrait pas arriver (max_charging = 0), si oui → on augmente wallbox
+Explanation:
+- If `grid_power > 0` (import) → consuming too much → reduce wallbox
+- If `grid_power < 0` (export) → unused surplus → increase wallbox
+- If `battery_power > 0` (discharge) → battery helping EV/house → reduce wallbox
+- If `battery_power < 0` (charge) → shouldn't happen (max_charging = 0), if so → increase wallbox
 
-Le calcul intègre automatiquement les variations de consommation maison : si la maison consomme plus, `grid_power` augmente, ce qui réduit `surplus_disponible` et donc le courant wallbox.
+The calculation automatically accounts for house consumption variations: if the house consumes more, `grid_power` increases, reducing `available_surplus` and thus the wallbox current.
 
-**Fréquence** : une fois par **minute**. Entre deux ajustements, la batterie peut brièvement se décharger pour couvrir la maison (comportement normal et souhaité du Deye).
+**Frequency**: once per **minute**. Between adjustments, the battery may briefly discharge to cover the house (normal and desired Deye behavior).
 
 ---
 
-## Fichiers du projet
+## Project Files
 
 ```
 Wallbox_Deye_HA_EMS/
-├── README.md                 # Ce fichier (spécification)
+├── README.md                 # This file (specification)
 ├── LICENSE
-├── config_example.py         # Exemple de configuration (commité)
-├── config.py                 # Configuration réelle (non commité, dans .gitignore)
-├── requirements.txt          # Dépendances Python (requests uniquement)
-├── ha_api.py                 # Wrapper API Home Assistant (lecture capteurs, écriture actionneurs)
-├── ems.py                    # Logique EMS : machine à états, algorithmes, boucle principale
-└── logs/                     # Répertoire de logs (non commité)
-    └── ems.log               # Log de chaque réglage wallbox/batterie
+├── config_example.py         # Configuration example (committed)
+├── config.py                 # Actual configuration (not committed, in .gitignore)
+├── requirements.txt          # Python dependencies (requests only)
+├── ha_api.py                 # Home Assistant API wrapper (read sensors, write actuators)
+├── ems.py                    # EMS logic: state machine, algorithms, main loop
+└── logs/                     # Log directory (not committed)
+    └── ems.log               # Log of each wallbox/battery adjustment
 ```
 
 ---
@@ -281,27 +281,27 @@ Wallbox_Deye_HA_EMS/
 
 ### `config_example.py`
 
-Fichier Python pur — zéro dépendance pour le parsing. À copier en `config.py` et personnaliser.
+Pure Python file — zero dependency for parsing. Copy to `config.py` and customize.
 
 ```python
-# config_example.py — copier en config.py et renseigner vos valeurs
+# config_example.py — copy to config.py and fill in your values
 
 # Home Assistant
 HA_URL = "http://192.168.1.XXX:8123"
-HA_TOKEN = "VOTRE_LONG_LIVED_ACCESS_TOKEN"
+HA_TOKEN = "YOUR_LONG_LIVED_ACCESS_TOKEN"
 
-# Seuils
-EV_CHARGING_DETECT_W = 40        # Shelly > 40 W = EV branchée
-SOLAR_AVAILABLE_W = 100           # Microinverter > 100 W = solaire disponible
-SOC_HYSTERESIS_PCT = 5            # Hystérésis SOC en points absolus
+# Thresholds
+EV_CHARGING_DETECT_W = 40        # Shelly > 40 W = EV plugged in
+SOLAR_AVAILABLE_W = 100           # Microinverter > 100 W = solar available
+SOC_HYSTERESIS_PCT = 5            # SOC hysteresis in absolute percentage points
 
-# Algorithme
-FAST_LOOP_INTERVAL_S = 1          # Boucle rapide (lecture capteurs + limitation décharge)
-SLOW_LOOP_INTERVAL_S = 60         # Boucle lente (pilotage wallbox)
-DISCHARGE_MARGIN_A = 1.0          # Marge courant décharge (+1 A)
-EMA_ALPHA = 0.3                   # Facteur lissage EMA
+# Algorithm
+FAST_LOOP_INTERVAL_S = 1          # Fast loop (sensor reads + discharge limitation)
+SLOW_LOOP_INTERVAL_S = 60         # Slow loop (wallbox steering)
+DISCHARGE_MARGIN_A = 1.0          # Discharge current margin (+1 A)
+EMA_ALPHA = 0.3                   # EMA smoothing factor
 
-# Valeurs par défaut (état IDLE)
+# Defaults (IDLE state)
 DEFAULT_MAX_CHARGING_CURRENT_A = 100
 DEFAULT_MAX_DISCHARGING_CURRENT_A = 100
 WALLBOX_MIN_CURRENT_A = 6
@@ -309,42 +309,42 @@ WALLBOX_MAX_CURRENT_A = 32
 
 # Logging
 LOG_FILE = "logs/ems.log"
-LOG_LEVEL = "INFO"                # DEBUG pour diagnostic
+LOG_LEVEL = "INFO"                # DEBUG for diagnostics
 ```
 
-### Sécurité
+### Security
 
-- `config.py` contient le token HA → **ajouté au `.gitignore`**
-- Seul `config_example.py` est commité (sans secrets)
+- `config.py` contains the HA token → **added to `.gitignore`**
+- Only `config_example.py` is committed (no secrets)
 
 ---
 
-## Installation & exécution
+## Installation & Running
 
 ```bash
-# Cloner le repo
+# Clone the repo
 git clone <repo_url>
 cd Wallbox_Deye_HA_EMS
 
-# Installer les dépendances
+# Install dependencies
 pip install -r requirements.txt
 
-# Copier et éditer la configuration
+# Copy and edit configuration
 cp config_example.py config.py
-nano config.py      # Renseigner IP HA + token
+nano config.py      # Fill in HA IP + token
 
-# Créer input_number.batt_charge_limit dans HA :
-#   - Aller dans Paramètres > Appareils & Services > Entrées
-#   - Créer un "Nombre" nommé "batt_charge_limit"
-#   - Min: 50, Max: 100, Pas: 5, Unité: %, Défaut: 80
+# Create input_number.batt_charge_limit in HA:
+#   - Go to Settings > Devices & Services > Helpers
+#   - Create a "Number" named "batt_charge_limit"
+#   - Min: 50, Max: 100, Step: 5, Unit: %, Default: 80
 
-# Lancer le script
+# Run the script
 python ems.py
 
-# (Optionnel) Lancer en service systemd pour démarrage automatique
+# (Optional) Run as a systemd service for auto-start
 ```
 
-### Service systemd (optionnel)
+### systemd Service (optional)
 
 ```ini
 [Unit]
