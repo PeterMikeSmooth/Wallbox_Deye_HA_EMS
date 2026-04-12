@@ -153,12 +153,18 @@ class EMS:
     def _compute_wallbox_surplus(self, s: dict) -> int:
         """Surplus steering algorithm (EV_SURPLUS only).
 
-        Returns the integer wallbox current in A.
+        Incremental: adjusts from current setpoint based on observed
+        grid + battery error.  Works regardless of wallbox charging mode
+        (minimal, normal, etc.) since we never assume P = I × V for the
+        wallbox — we just observe the actual power balance.
         """
-        available = s["ev_power"] - s["grid_power"] - s["battery_power"]
+        # Positive excess = surplus being wasted (export or unwanted battery charge)
+        excess = -(s["grid_power"] + s["battery_power"])
         voltage = max(s["grid_voltage"], 1.0)
-        target = available / voltage
-        return int(clamp(round(target), config.WALLBOX_MIN_CURRENT_A, config.WALLBOX_MAX_CURRENT_A))
+        delta = round(excess / voltage)
+        current = self._last_written_wallbox or config.WALLBOX_MIN_CURRENT_A
+        target = current + delta
+        return int(clamp(target, config.WALLBOX_MIN_CURRENT_A, config.WALLBOX_MAX_CURRENT_A))
 
     # -- state evaluation -----------------------------------------------------
 
