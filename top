@@ -1,0 +1,28 @@
+[1mdiff --git a/ems.py b/ems.py[m
+[1mindex c3facc0..a36a126 100644[m
+[1m--- a/ems.py[m
+[1m+++ b/ems.py[m
+[36m@@ -122,8 +122,9 @@[m [mclass EMS:[m
+             self._last_written_charging = amps[m
+ [m
+     def _set_wallbox(self, amps: int) -> None:[m
+[32m+[m[32m        # Always write — the wallbox cloud integration may override our value[m
+[32m+[m[32m        self.ha.set_wallbox_current(amps)[m
+         if self._last_written_wallbox != amps:[m
+[31m-            self.ha.set_wallbox_current(amps)[m
+             log.info("SET wallbox_current = %d A", amps)[m
+             self._last_written_wallbox = amps[m
+ [m
+[1mdiff --git a/ha_api.py b/ha_api.py[m
+[1mindex 1175f21..1b14550 100644[m
+[1m--- a/ha_api.py[m
+[1m+++ b/ha_api.py[m
+[36m@@ -9,7 +9,7 @@[m [mlogger = logging.getLogger(__name__)[m
+ SENSOR_BATTERY_SOC = "sensor.deye_battery"[m
+ SENSOR_BATTERY_VOLTAGE = "sensor.deye_battery_voltage"[m
+ SENSOR_BATTERY_POWER = "sensor.deye_battery_power"[m
+[31m-SENSOR_GRID_POWER = "sensor.deye_grid_power"[m
+[32m+[m[32mSENSOR_GRID_POWER = "sensor.shellyem_34945478aee1_channel_1_power"[m
+ SENSOR_MICROINVERTER_POWER = "sensor.deye_microinverter_power"[m
+ SENSOR_GRID_VOLTAGE = "sensor.deye_load_l1_voltage"[m
+ SENSOR_EV_POWER = "sensor.shellyem_34945478aee1_channel_2_power"[m

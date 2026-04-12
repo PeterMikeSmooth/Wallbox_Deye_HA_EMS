@@ -122,8 +122,9 @@ class EMS:
             self._last_written_charging = amps
 
     def _set_wallbox(self, amps: int) -> None:
+        # Always write — the wallbox cloud integration may override our value
+        self.ha.set_wallbox_current(amps)
         if self._last_written_wallbox != amps:
-            self.ha.set_wallbox_current(amps)
             log.info("SET wallbox_current = %d A", amps)
             self._last_written_wallbox = amps
 
