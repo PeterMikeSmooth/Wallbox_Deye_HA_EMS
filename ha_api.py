@@ -14,6 +14,9 @@ SENSOR_MICROINVERTER_POWER = "sensor.deye_microinverter_power"
 SENSOR_GRID_VOLTAGE = "sensor.deye_load_l1_voltage"
 SENSOR_EV_POWER = "sensor.shellyem_34945478aee1_channel_2_power"
 SENSOR_BATT_CHARGE_LIMIT = "input_number.batt_charge_limit"
+SENSOR_BATT_CHARGE_PRIO = "input_number.batt_charge_prio"
+SENSOR_EMS_MODE = "input_select.ems_mode"
+INPUT_EMS_STATE = "input_text.ems_state"
 
 NUMBER_MAX_CHARGING_CURRENT = "number.deye_battery_max_charging_current"
 NUMBER_MAX_DISCHARGING_CURRENT = "number.deye_battery_max_discharging_current"
@@ -42,6 +45,14 @@ class HomeAssistantAPI:
         value = resp.json()["state"]
         return float(value)
 
+    def get_text_state(self, entity_id: str) -> str:
+        """Return the string state of an entity (for input_select, etc.)."""
+        resp = self._session.get(
+            f"{self._base}/api/states/{entity_id}", timeout=10
+        )
+        resp.raise_for_status()
+        return resp.json()["state"]
+
     def read_all_sensors(self) -> dict:
         """Read every sensor needed in one batch and return a dict."""
         return {
@@ -53,6 +64,8 @@ class HomeAssistantAPI:
             "grid_power": self.get_state(SENSOR_GRID_POWER),
             "grid_voltage": self.get_state(SENSOR_GRID_VOLTAGE),
             "batt_charge_limit": self.get_state(SENSOR_BATT_CHARGE_LIMIT),
+            "batt_charge_prio": self.get_state(SENSOR_BATT_CHARGE_PRIO),
+            "ems_mode": self.get_text_state(SENSOR_EMS_MODE),
         }
 
     # -- write helpers ---------------------------------------------------------
@@ -75,3 +88,12 @@ class HomeAssistantAPI:
 
     def set_wallbox_current(self, amps: int) -> None:
         self.set_number(NUMBER_WALLBOX_MAX_CURRENT, amps)
+
+    def set_ems_state(self, state: str) -> None:
+        """Write the current EMS state to HA input_text."""
+        resp = self._session.post(
+            f"{self._base}/api/services/input_text/set_value",
+            json={"entity_id": INPUT_EMS_STATE, "value": state},
+            timeout=10,
+        )
+        resp.raise_for_status()

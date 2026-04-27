@@ -18,6 +18,7 @@ EMA_ALPHA = 0.3                   # EMA smoothing factor
 # Defaults (IDLE state)
 DEFAULT_MAX_CHARGING_CURRENT_A = 100
 DEFAULT_MAX_DISCHARGING_CURRENT_A = 100
+SURPLUS_MAX_CHARGING_A = 80       # In SOLAR_SURPLUS: allow battery to absorb transient solar spikes
 WALLBOX_MIN_CURRENT_A = 6
 WALLBOX_MAX_CURRENT_A = 32
 

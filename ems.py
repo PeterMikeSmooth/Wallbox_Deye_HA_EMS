@@ -49,9 +49,10 @@ log = _setup_logging()
 
 class State(enum.Enum):
     IDLE = "IDLE"
+    FULL_SPEED = "FULL_SPEED"
     EV_NO_SOLAR = "EV_NO_SOLAR"
-    EV_BATTERY_PRIORITY = "EV_BATTERY_PRIORITY"
-    EV_SURPLUS = "EV_SURPLUS"
+    BATTERY_PRIORITY = "BATTERY_PRIORITY"
+    SOLAR_SURPLUS = "SOLAR_SURPLUS"
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +75,7 @@ class EMS:
         self._last_written_discharge = None  # last integer written to HA
         self._last_written_wallbox = None
         self._last_written_charging = None
-        self._last_surplus_tick = 0.0       # timestamp of last wallbox adjustment
+        self._last_slow_tick = 0.0          # timestamp of last slow-loop action
 
     # -- entry actions --------------------------------------------------------
 
@@ -83,29 +84,37 @@ class EMS:
         self.state = State.IDLE
         self._ema_discharge = None
         self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
-        self._set_max_charging(config.DEFAULT_MAX_CHARGING_CURRENT_A)
+        # max_charging managed by batt_charge_limit enforcement in tick()
+
+    def _enter_full_speed(self) -> None:
+        log.info("→ FULL_SPEED")
+        self.state = State.FULL_SPEED
+        self._ema_discharge = None
+        self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
+        self._last_slow_tick = time.monotonic()
+        # max_discharging managed in tick() based on solar availability
 
     def _enter_ev_no_solar(self) -> None:
         log.info("→ EV_NO_SOLAR")
         self.state = State.EV_NO_SOLAR
-        self._set_max_charging(config.DEFAULT_MAX_CHARGING_CURRENT_A)
-        # discharge will be driven by the fast loop
+        self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
+        # discharge driven by fast loop in tick()
 
-    def _enter_ev_battery_priority(self) -> None:
-        log.info("→ EV_BATTERY_PRIORITY")
-        self.state = State.EV_BATTERY_PRIORITY
+    def _enter_battery_priority(self) -> None:
+        log.info("→ BATTERY_PRIORITY")
+        self.state = State.BATTERY_PRIORITY
         self._ema_discharge = None
-        self._set_max_charging(config.DEFAULT_MAX_CHARGING_CURRENT_A)
         self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
+        # max_charging managed by batt_charge_limit enforcement in tick()
 
-    def _enter_ev_surplus(self) -> None:
-        log.info("→ EV_SURPLUS")
-        self.state = State.EV_SURPLUS
+    def _enter_solar_surplus(self) -> None:
+        log.info("→ SOLAR_SURPLUS")
+        self.state = State.SOLAR_SURPLUS
         self._ema_discharge = None
-        self._set_max_charging(0)
         self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
-        self._last_surplus_tick = 0.0  # force immediate first wallbox adjustment
+        self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
+        # max_charging = SURPLUS_MAX_CHARGING_A, managed in tick()
 
     # -- write-with-dedup helpers ---------------------------------------------
 
@@ -171,51 +180,55 @@ class EMS:
     def _determine_target_state(self, s: dict) -> State:
         """Determine the target state based on current sensor readings."""
         ev_charging = s["ev_power"] > config.EV_CHARGING_DETECT_W
-        solar_available = s["solar_power"] > config.SOLAR_AVAILABLE_W
-        soc = s["battery_soc"]
-        limit = s["batt_charge_limit"]
 
         if not ev_charging:
             return State.IDLE
 
+        mode = s.get("ems_mode", "SOLAR_ONLY").upper()
+        if mode == "FULL_SPEED":
+            return State.FULL_SPEED
+
+        # SOLAR_ONLY mode
+        solar_available = s["solar_power"] > config.SOLAR_AVAILABLE_W
         if not solar_available:
             return State.EV_NO_SOLAR
 
-        # Solar is available and EV is charging
-        if self.state == State.EV_SURPLUS:
-            # Hysteresis: only drop back if SOC fell significantly
-            if soc < (limit - config.SOC_HYSTERESIS_PCT):
-                return State.EV_BATTERY_PRIORITY
-            return State.EV_SURPLUS
+        soc = s["battery_soc"]
+        prio = s["batt_charge_prio"]
 
-        if soc >= limit:
-            return State.EV_SURPLUS
+        # Hysteresis: stay in SOLAR_SURPLUS unless SOC drops significantly
+        if self.state == State.SOLAR_SURPLUS:
+            if soc < (prio - config.SOC_HYSTERESIS_PCT):
+                return State.BATTERY_PRIORITY
+            return State.SOLAR_SURPLUS
 
-        return State.EV_BATTERY_PRIORITY
+        if soc >= prio:
+            return State.SOLAR_SURPLUS
+
+        return State.BATTERY_PRIORITY
 
     def _transition(self, target: State) -> None:
         """Perform the transition from current state to target state."""
         if target == self.state:
             return
 
-        old = self.state
-
-        # When leaving a solar state for EV_NO_SOLAR, set wallbox to minimum
-        if target == State.EV_NO_SOLAR and old in (
-            State.EV_BATTERY_PRIORITY,
-            State.EV_SURPLUS,
-        ):
-            self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
-
         # Enter target state
         if target == State.IDLE:
             self._enter_idle()
+        elif target == State.FULL_SPEED:
+            self._enter_full_speed()
         elif target == State.EV_NO_SOLAR:
             self._enter_ev_no_solar()
-        elif target == State.EV_BATTERY_PRIORITY:
-            self._enter_ev_battery_priority()
-        elif target == State.EV_SURPLUS:
-            self._enter_ev_surplus()
+        elif target == State.BATTERY_PRIORITY:
+            self._enter_battery_priority()
+        elif target == State.SOLAR_SURPLUS:
+            self._enter_solar_surplus()
+
+        # Update HA with current state
+        try:
+            self.ha.set_ems_state(self.state.value)
+        except Exception:
+            log.warning("Failed to update ems_state in HA", exc_info=True)
 
     # -- per-tick logic -------------------------------------------------------
 
@@ -231,16 +244,37 @@ class EMS:
             amps = self._compute_discharge_limit(s)
             self._set_max_discharging(amps)
 
-        elif self.state == State.EV_SURPLUS:
+        elif self.state == State.FULL_SPEED:
+            if s["solar_power"] > config.SOLAR_AVAILABLE_W:
+                self._set_max_discharging(0)
+                self._ema_discharge = None
+            else:
+                amps = self._compute_discharge_limit(s)
+                self._set_max_discharging(amps)
+            # Re-send wallbox 32A periodically (cloud may override)
             now = time.monotonic()
-            if now - self._last_surplus_tick >= config.SLOW_LOOP_INTERVAL_S:
-                self._last_surplus_tick = now
+            if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
+                self._last_slow_tick = now
+                self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
+
+        elif self.state == State.SOLAR_SURPLUS:
+            now = time.monotonic()
+            if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
+                self._last_slow_tick = now
                 amps = self._compute_wallbox_surplus(s)
                 self._set_wallbox(amps)
                 log.info(
                     "SURPLUS steering: grid=%.0fW  batt=%.0fW  ev=%.0fW → wallbox=%dA",
                     s["grid_power"], s["battery_power"], s["ev_power"], amps,
                 )
+
+        # 3. Enforce batt_charge_limit across all states
+        if self.state == State.SOLAR_SURPLUS:
+            self._set_max_charging(config.SURPLUS_MAX_CHARGING_A)
+        elif s["battery_soc"] >= s["batt_charge_limit"]:
+            self._set_max_charging(0)
+        else:
+            self._set_max_charging(config.DEFAULT_MAX_CHARGING_CURRENT_A)
 
 
 # ---------------------------------------------------------------------------
@@ -258,11 +292,12 @@ def main() -> None:
             sensors = ha.read_all_sensors()
             log.debug(
                 "sensors: ev=%.0fW solar=%.0fW soc=%.0f%% batt_pwr=%.0fW "
-                "grid=%.0fW batt_v=%.1fV grid_v=%.1fV limit=%.0f%% | state=%s",
+                "grid=%.0fW batt_v=%.1fV grid_v=%.1fV limit=%.0f%% prio=%.0f%% mode=%s | state=%s",
                 sensors["ev_power"], sensors["solar_power"],
                 sensors["battery_soc"], sensors["battery_power"],
                 sensors["grid_power"], sensors["battery_voltage"],
                 sensors["grid_voltage"], sensors["batt_charge_limit"],
+                sensors["batt_charge_prio"], sensors["ems_mode"],
                 ems.state.value,
             )
             ems.tick(sensors)
