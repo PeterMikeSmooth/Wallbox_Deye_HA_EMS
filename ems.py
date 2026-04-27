@@ -357,7 +357,7 @@ class EMS:
                     grid_ratio * 100, "OFF-PEAK" if off_peak else "PEAK", amps,
                 )
 
-        elif self.state == State.SOLAR_SOLAR_STORAGE_TO_EV:
+        elif self.state == State.SOLAR_STORAGE_TO_EV:
             soc = s["battery_soc"]
             # SOC floor with hysteresis (40% stop, 42% resume)
             if self._storage_low_soc:
