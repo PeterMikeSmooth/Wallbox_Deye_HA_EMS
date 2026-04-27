@@ -218,9 +218,13 @@ class EMS:
     def _compute_storage_discharge(self, s: dict, ratio: float) -> int:
         """Discharge algorithm for SOLAR_STORAGE_TO_EV.
 
-        Battery covers `ratio` of EV + house load, minus solar contribution.
+        Battery covers `ratio` of EV power + house load, minus solar.
+        At equilibrium: discharge ≈ (ratio * ev + house) / V.
         """
-        target_power = s["battery_power"] + s["grid_power"] - ratio * s["ev_power"]
+        target_power = (
+            s["solar_power"] + s["battery_power"] + s["grid_power"]
+            - (1 - ratio) * s["ev_power"]
+        )
         raw = max(target_power, 0) / max(s["battery_voltage"], 1.0) + config.DISCHARGE_MARGIN_A
 
         # EMA smoothing
