@@ -19,6 +19,20 @@ EMA_ALPHA = 0.3                   # EMA smoothing factor
 DEFAULT_MAX_CHARGING_CURRENT_A = 100
 DEFAULT_MAX_DISCHARGING_CURRENT_A = 100
 SURPLUS_MAX_CHARGING_A = 80       # In SOLAR_SURPLUS: allow battery to absorb transient solar spikes
+STORAGE_TO_EV_SOC_FLOOR = 40      # STORAGE_TO_EV: stop discharging below this SOC %
+# Off-peak windows: list of (start, end) as (hour, minute) tuples
+OFF_PEAK_WINDOWS = [
+    ((1, 54), (6, 54)),
+    ((12, 24), (15, 24)),
+]
+
+# SOLAR_BOOSTED: share of EV power imported from grid
+BOOSTED_GRID_RATIO_OFF_PEAK = 0.50  # Off-peak: grid 50%, solar 50%
+BOOSTED_GRID_RATIO_PEAK = 0.60      # Peak: grid 60%, solar 40%
+
+# SOLAR_STORAGE_TO_EV: share of EV power covered by battery
+STORAGE_BATT_RATIO_OFF_PEAK = 0.50  # Off-peak: battery 50%
+STORAGE_BATT_RATIO_PEAK = 0.40      # Peak: battery 40%
 WALLBOX_MIN_CURRENT_A = 6
 WALLBOX_MAX_CURRENT_A = 32
 
