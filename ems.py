@@ -413,7 +413,7 @@ class EMS:
 
         # 3. Update grid ratio indicator
         if s["ev_power"] > config.EV_CHARGING_DETECT_W:
-            ratio_pct = round(s["grid_power"] / s["ev_power"] * 100)
+            ratio_pct = int(clamp(round(s["grid_power"] / s["ev_power"] * 100), 0, 100))
         else:
             ratio_pct = 0
         self._set_grid_ratio(ratio_pct)
