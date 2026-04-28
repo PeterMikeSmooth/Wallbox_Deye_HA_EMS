@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python3 -m py_compile ems\\.py && git add -A && git commit -m \"fix: start wallbox at MIN on SOLAR_SURPLUS/BOOSTED entry to avoid overshoot\" && git push$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

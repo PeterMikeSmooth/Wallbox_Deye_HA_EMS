@@ -139,6 +139,7 @@ class EMS:
         self.state = State.SOLAR_SURPLUS
         self._ema_discharge = None
         self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
         self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
 
     def _enter_solar_boosted(self) -> None:
@@ -146,6 +147,7 @@ class EMS:
         self.state = State.SOLAR_BOOSTED
         self._ema_discharge = None
         self._set_max_discharging(0)
+        self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
         self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
 
     def _enter_solar_storage_to_ev(self) -> None:
