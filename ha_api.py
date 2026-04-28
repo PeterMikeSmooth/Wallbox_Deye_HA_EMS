@@ -16,6 +16,7 @@ SENSOR_EV_POWER = "sensor.shellyem_34945478aee1_channel_2_power"
 SENSOR_BATT_CHARGE_LIMIT = "input_number.batt_charge_limit"
 SENSOR_BATT_CHARGE_PRIO = "input_number.batt_charge_prio"
 SENSOR_EMS_MODE = "input_select.ems_mode"
+SENSOR_WALLBOX_STATUS = "sensor.wallbox_pulsar_max_sn_429953_status_description"
 INPUT_EMS_STATE = "input_text.ems_state"
 
 NUMBER_MAX_CHARGING_CURRENT = "number.deye_battery_max_charging_current"
@@ -66,6 +67,7 @@ class HomeAssistantAPI:
             "batt_charge_limit": self.get_state(SENSOR_BATT_CHARGE_LIMIT),
             "batt_charge_prio": self.get_state(SENSOR_BATT_CHARGE_PRIO),
             "ems_mode": self.get_text_state(SENSOR_EMS_MODE),
+            "wallbox_status": self.get_text_state(SENSOR_WALLBOX_STATUS),
         }
 
     # -- write helpers ---------------------------------------------------------
@@ -94,6 +96,15 @@ class HomeAssistantAPI:
         resp = self._session.post(
             f"{self._base}/api/services/input_text/set_value",
             json={"entity_id": INPUT_EMS_STATE, "value": state},
+            timeout=10,
+        )
+        resp.raise_for_status()
+
+    def set_ems_mode(self, mode: str) -> None:
+        """Write the EMS mode to HA input_select."""
+        resp = self._session.post(
+            f"{self._base}/api/services/input_select/select_option",
+            json={"entity_id": SENSOR_EMS_MODE, "option": mode},
             timeout=10,
         )
         resp.raise_for_status()

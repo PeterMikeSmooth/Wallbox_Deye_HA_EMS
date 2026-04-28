@@ -35,6 +35,7 @@ STORAGE_BATT_RATIO_OFF_PEAK = 0.50  # Off-peak: battery 50%
 STORAGE_BATT_RATIO_PEAK = 0.40      # Peak: battery 40%
 WALLBOX_MIN_CURRENT_A = 6
 WALLBOX_MAX_CURRENT_A = 32
+DEFAULT_EMS_MODE = "SOLAR_ONLY"   # Mode reset when car is plugged in
 
 # Logging
 LOG_FILE = "logs/ems.log"

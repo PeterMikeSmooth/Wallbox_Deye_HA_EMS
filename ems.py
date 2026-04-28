@@ -104,6 +104,7 @@ class EMS:
         self._last_written_charging = None
         self._last_slow_tick = 0.0          # timestamp of last slow-loop action
         self._storage_low_soc = False       # STORAGE_TO_EV: SOC below floor
+        self._car_connected = False         # wallbox: car plugged in
 
     # -- entry actions --------------------------------------------------------
 
@@ -310,6 +311,17 @@ class EMS:
 
     def tick(self, s: dict) -> None:
         """Called every fast-loop iteration with fresh sensor data *s*."""
+
+        # 0. Detect car plug-in → reset mode to default
+        car_connected = "connected" in s.get("wallbox_status", "").lower()
+        if car_connected and not self._car_connected:
+            log.info("Car plugged in — resetting ems_mode to %s", config.DEFAULT_EMS_MODE)
+            try:
+                self.ha.set_ems_mode(config.DEFAULT_EMS_MODE)
+                s["ems_mode"] = config.DEFAULT_EMS_MODE
+            except Exception:
+                log.warning("Failed to reset ems_mode", exc_info=True)
+        self._car_connected = car_connected
 
         # 1. Evaluate state machine
         target = self._determine_target_state(s)
