@@ -105,6 +105,7 @@ class EMS:
         self._last_slow_tick = 0.0          # timestamp of last slow-loop action
         self._storage_low_soc = False       # STORAGE_TO_EV: SOC below floor
         self._car_connected = False         # wallbox: car plugged in
+        self._last_written_grid_ratio = None
 
     # -- entry actions --------------------------------------------------------
 
@@ -175,6 +176,14 @@ class EMS:
         if self._last_written_wallbox != amps:
             log.info("SET wallbox_current = %d A", amps)
             self._last_written_wallbox = amps
+
+    def _set_grid_ratio(self, pct: int) -> None:
+        if self._last_written_grid_ratio != pct:
+            try:
+                self.ha.set_number("input_number.grid_ratio_value", pct)
+            except Exception:
+                log.warning("Failed to update grid_ratio_value", exc_info=True)
+            self._last_written_grid_ratio = pct
 
     # -- algorithms -----------------------------------------------------------
 
@@ -402,7 +411,14 @@ class EMS:
                     self._last_slow_tick = now
                     self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
 
-        # 3. Enforce batt_charge_limit across all states
+        # 3. Update grid ratio indicator
+        if s["ev_power"] > config.EV_CHARGING_DETECT_W:
+            ratio_pct = round(s["grid_power"] / s["ev_power"] * 100)
+        else:
+            ratio_pct = 0
+        self._set_grid_ratio(ratio_pct)
+
+        # 4. Enforce batt_charge_limit across all states
         if self.state in (State.SOLAR_SURPLUS, State.SOLAR_BOOSTED):
             self._set_max_charging(config.SURPLUS_MAX_CHARGING_A)
         elif s["battery_soc"] >= s["batt_charge_limit"]:
