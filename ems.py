@@ -180,7 +180,7 @@ class EMS:
     def _set_grid_ratio(self, pct: int) -> None:
         if self._last_written_grid_ratio != pct:
             try:
-                self.ha.set_number("input_number.grid_ratio_value", pct)
+                self.ha.set_input_number("input_number.grid_ratio_value", pct)
             except Exception:
                 log.warning("Failed to update grid_ratio_value", exc_info=True)
             self._last_written_grid_ratio = pct

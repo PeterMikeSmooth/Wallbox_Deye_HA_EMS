@@ -92,6 +92,15 @@ class HomeAssistantAPI:
     def set_wallbox_current(self, amps: int) -> None:
         self.set_number(NUMBER_WALLBOX_MAX_CURRENT, amps)
 
+    def set_input_number(self, entity_id: str, value: float) -> None:
+        """Call input_number.set_value service."""
+        resp = self._session.post(
+            f"{self._base}/api/services/input_number/set_value",
+            json={"entity_id": entity_id, "value": value},
+            timeout=10,
+        )
+        resp.raise_for_status()
+
     def set_ems_state(self, state: str) -> None:
         """Write the current EMS state to HA input_text."""
         resp = self._session.post(
