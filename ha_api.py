@@ -118,3 +118,13 @@ class HomeAssistantAPI:
             timeout=10,
         )
         resp.raise_for_status()
+
+    def set_switch(self, entity_id: str, on: bool) -> None:
+        """Turn a switch on or off."""
+        service = "switch/turn_on" if on else "switch/turn_off"
+        resp = self._session.post(
+            f"{self._base}/api/services/{service}",
+            json={"entity_id": entity_id},
+            timeout=10,
+        )
+        resp.raise_for_status()

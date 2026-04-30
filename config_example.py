@@ -30,9 +30,16 @@ OFF_PEAK_WINDOWS = [
 BOOSTED_GRID_RATIO_OFF_PEAK = 0.50  # Off-peak: grid 50%, solar 50%
 BOOSTED_GRID_RATIO_PEAK = 0.60      # Peak: grid 60%, solar 40%
 
-# SOLAR_STORAGE_TO_EV: share of EV power covered by battery
+# STORAGE_BOOSTED: share of EV power covered by battery
 STORAGE_BATT_RATIO_OFF_PEAK = 0.50  # Off-peak: battery 50%
 STORAGE_BATT_RATIO_PEAK = 0.40      # Peak: battery 40%
+
+# SOLAR_BOOSTED_N_STORAGE: battery charge target while boosted
+STORAGE_CHARGE_W = 800               # Battery charge power in W
+
+# STORAGE_ONLY: battery covers house + EV (no grid)
+STORAGE_ONLY_MAX_CURRENT_A = 16      # Wallbox max current in STORAGE_ONLY
+
 WALLBOX_MIN_CURRENT_A = 6
 WALLBOX_MAX_CURRENT_A = 32
 DEFAULT_EMS_MODE = "SOLAR_ONLY"   # Mode reset when car is plugged in
