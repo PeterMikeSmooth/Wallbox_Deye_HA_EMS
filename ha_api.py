@@ -128,3 +128,12 @@ class HomeAssistantAPI:
             timeout=10,
         )
         resp.raise_for_status()
+
+    def set_select(self, entity_id: str, option: str) -> None:
+        """Set a select entity option."""
+        resp = self._session.post(
+            f"{self._base}/api/services/select/select_option",
+            json={"entity_id": entity_id, "option": option},
+            timeout=10,
+        )
+        resp.raise_for_status()

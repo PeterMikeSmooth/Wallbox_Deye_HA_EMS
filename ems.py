@@ -163,7 +163,9 @@ class EMS:
         self._last_slow_tick = 0.0
         try:
             self.ha.set_switch("switch.deye_battery_grid_charging", True)
-            log.info("Enabled grid charging")
+            for i in range(1, 7):
+                self.ha.set_select(f"select.deye_program_{i}_charging", "Grid")
+            log.info("Enabled grid charging + ToU program slots")
         except Exception:
             log.warning("Failed to enable grid charging", exc_info=True)
 
@@ -330,7 +332,9 @@ class EMS:
         if self.state == State.SOLAR_BOOSTED_N_STORAGE:
             try:
                 self.ha.set_switch("switch.deye_battery_grid_charging", False)
-                log.info("Disabled grid charging")
+                for i in range(1, 7):
+                    self.ha.set_select(f"select.deye_program_{i}_charging", "Disabled")
+                log.info("Disabled grid charging + ToU program slots")
             except Exception:
                 log.warning("Failed to disable grid charging", exc_info=True)
 
@@ -433,26 +437,25 @@ class EMS:
                 off_peak = is_off_peak()
                 grid_ratio = config.BOOSTED_GRID_RATIO_OFF_PEAK if off_peak else config.BOOSTED_GRID_RATIO_PEAK
 
-                # Battery charge target — stop if grid_ratio exceeded or SOC full
-                batt_charge_w = config.STORAGE_CHARGE_W
-                observed_ratio = s["grid_power"] / s["ev_power"] if s["ev_power"] > config.EV_CHARGING_DETECT_W else 0
-                if observed_ratio > grid_ratio or s["battery_soc"] >= s["batt_charge_limit"]:
-                    batt_charge_w = 0
+                # Allow battery to charge up to STORAGE_CHARGE_W
+                if s["battery_soc"] >= s["batt_charge_limit"]:
+                    self._set_max_charging(0)
+                else:
+                    batt_charge_a = int(config.STORAGE_CHARGE_W / max(s["battery_voltage"], 1.0))
+                    self._set_max_charging(batt_charge_a)
 
-                batt_charge_a = int(batt_charge_w / max(s["battery_voltage"], 1.0))
-                self._set_max_charging(batt_charge_a)
-
-                # Steering: reduce grid_target by charge amount so grid_ratio stays on target
-                adjusted_target = s["ev_power"] * grid_ratio - batt_charge_w
+                # Compensate grid_target by ACTUAL battery charge to keep grid_ratio on target
+                actual_batt_charge = max(-s["battery_power"], 0)
+                adjusted_target = s["ev_power"] * grid_ratio - actual_batt_charge
                 amps = self._compute_wallbox_surplus(
                     s, grid_target=max(adjusted_target, 0)
                 )
                 self._set_wallbox(amps)
                 log.info(
                     "BOOSTED+STORAGE steering: grid=%.0fW batt=%.0fW ev=%.0fW "
-                    "batt_charge=%dW grid_ratio=%.0f%% %s → wallbox=%dA",
+                    "actual_charge=%.0fW grid_ratio=%.0f%% %s → wallbox=%dA",
                     s["grid_power"], s["battery_power"], s["ev_power"],
-                    batt_charge_w, grid_ratio * 100,
+                    actual_batt_charge, grid_ratio * 100,
                     "OFF-PEAK" if off_peak else "PEAK", amps,
                 )
 
