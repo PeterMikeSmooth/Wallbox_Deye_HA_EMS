@@ -312,8 +312,13 @@ class EMS:
         else:
             surplus_state = State.SOLAR_SURPLUS
 
+        # SOLAR_BOOSTED modes: always go to surplus (never discharge battery)
+        if surplus_state != State.SOLAR_SURPLUS:
+            return surplus_state
+
+        # SOLAR_ONLY: respect battery priority threshold
         # Hysteresis: stay in surplus unless SOC drops significantly
-        if self.state in (State.SOLAR_SURPLUS, State.SOLAR_BOOSTED, State.SOLAR_BOOSTED_N_STORAGE):
+        if self.state == State.SOLAR_SURPLUS:
             if soc < (prio - config.SOC_HYSTERESIS_PCT):
                 return State.BATTERY_PRIORITY
             return surplus_state
