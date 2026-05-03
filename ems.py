@@ -131,11 +131,15 @@ class EMS:
         self.state = State.EV_NO_SOLAR
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
 
-    def _enter_battery_priority(self) -> None:
+    def _enter_battery_priority(self, mode: str = "SOLAR_ONLY") -> None:
         log.info("→ BATTERY_PRIORITY")
         self.state = State.BATTERY_PRIORITY
         self._ema_discharge = None
-        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        # Boosted modes: never discharge battery even in BATTERY_PRIORITY
+        if mode in ("SOLAR_BOOSTED", "SOLAR_BOOSTED_N_STORAGE"):
+            self._set_max_discharging(0)
+        else:
+            self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
 
     def _enter_solar_surplus(self) -> None:
@@ -312,13 +316,8 @@ class EMS:
         else:
             surplus_state = State.SOLAR_SURPLUS
 
-        # SOLAR_BOOSTED modes: always go to surplus (never discharge battery)
-        if surplus_state != State.SOLAR_SURPLUS:
-            return surplus_state
-
-        # SOLAR_ONLY: respect battery priority threshold
         # Hysteresis: stay in surplus unless SOC drops significantly
-        if self.state == State.SOLAR_SURPLUS:
+        if self.state in (State.SOLAR_SURPLUS, State.SOLAR_BOOSTED, State.SOLAR_BOOSTED_N_STORAGE):
             if soc < (prio - config.SOC_HYSTERESIS_PCT):
                 return State.BATTERY_PRIORITY
             return surplus_state
@@ -328,7 +327,7 @@ class EMS:
 
         return State.BATTERY_PRIORITY
 
-    def _transition(self, target: State) -> None:
+    def _transition(self, target: State, s: dict) -> None:
         """Perform the transition from current state to target state."""
         if target == self.state:
             return
@@ -351,7 +350,7 @@ class EMS:
         elif target == State.EV_NO_SOLAR:
             self._enter_ev_no_solar()
         elif target == State.BATTERY_PRIORITY:
-            self._enter_battery_priority()
+            self._enter_battery_priority(s.get("ems_mode", "SOLAR_ONLY").upper())
         elif target == State.SOLAR_SURPLUS:
             self._enter_solar_surplus()
         elif target == State.SOLAR_BOOSTED:
@@ -387,7 +386,7 @@ class EMS:
 
         # 1. Evaluate state machine
         target = self._determine_target_state(s)
-        self._transition(target)
+        self._transition(target, s)
 
         # 2. Per-state continuous work
         if self.state == State.EV_NO_SOLAR:
