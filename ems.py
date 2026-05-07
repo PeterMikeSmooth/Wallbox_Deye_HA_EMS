@@ -258,15 +258,15 @@ class EMS:
         target = current + delta
         return int(clamp(target, config.WALLBOX_MIN_CURRENT_A, config.WALLBOX_MAX_CURRENT_A))
 
-    def _compute_storage_discharge(self, s: dict, ratio: float) -> int:
+    def _compute_storage_discharge(self, s: dict, grid_ratio: float) -> int:
         """Discharge algorithm for STORAGE_BOOSTED / STORAGE_ONLY.
 
-        Battery covers `ratio` of EV power + house load, minus solar.
-        At equilibrium: discharge ≈ (ratio * ev + house) / V.
+        Targets grid = grid_ratio × ev_power.
+        At equilibrium: discharge ≈ (1 - grid_ratio) × ev + house - solar.
         """
         target_power = (
-            s["solar_power"] + s["battery_power"] + s["grid_power"]
-            - (1 - ratio) * s["ev_power"]
+            s["battery_power"] + s["grid_power"]
+            - grid_ratio * s["ev_power"]
         )
         raw = max(target_power, 0) / max(s["battery_voltage"], 1.0) + config.DISCHARGE_MARGIN_A
 
@@ -483,8 +483,8 @@ class EMS:
                 self._set_max_discharging(0)
             else:
                 off_peak = is_off_peak()
-                ratio = config.STORAGE_BATT_RATIO_OFF_PEAK if off_peak else config.STORAGE_BATT_RATIO_PEAK
-                amps = self._compute_storage_discharge(s, ratio)
+                grid_ratio = config.BOOSTED_GRID_RATIO_OFF_PEAK if off_peak else config.BOOSTED_GRID_RATIO_PEAK
+                amps = self._compute_storage_discharge(s, grid_ratio)
                 self._set_max_discharging(amps)
                 # Re-send wallbox 32A periodically (cloud may override)
                 now = time.monotonic()
@@ -513,8 +513,8 @@ class EMS:
                 amps = self._compute_discharge_limit(s)
                 self._set_max_discharging(amps)
             else:
-                # Battery covers everything: ratio=1.0 → grid ≈ 0
-                amps = self._compute_storage_discharge(s, ratio=1.0)
+                # Battery covers everything: grid_ratio=0 → grid ≈ 0
+                amps = self._compute_storage_discharge(s, grid_ratio=0)
                 self._set_max_discharging(amps)
                 # Re-send wallbox periodically (cloud may override)
                 now = time.monotonic()
