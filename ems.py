@@ -2,7 +2,7 @@
 
 State machine with 7 states:
   IDLE, FULL_SPEED, EV_NO_SOLAR, BATTERY_PRIORITY,
-  SOLAR_SURPLUS, SOLAR_BOOSTED, STORAGE_BOOSTED, STORAGE_ONLY.
+  SOLAR_ONLY, SOLAR_BOOSTED, STORAGE_BOOSTED, STORAGE_ONLY.
 
 Modes (input_select.ems_mode):
   SOLAR_ONLY, SOLAR_BOOSTED, FULL_SPEED, STORAGE_BOOSTED, STORAGE_ONLY.
@@ -59,7 +59,7 @@ class State(enum.Enum):
     FULL_SPEED = "FULL_SPEED"
     EV_NO_SOLAR = "EV_NO_SOLAR"
     BATTERY_PRIORITY = "BATTERY_PRIORITY"
-    SOLAR_SURPLUS = "SOLAR_SURPLUS"
+    SOLAR_ONLY = "SOLAR_ONLY"
     SOLAR_BOOSTED = "SOLAR_BOOSTED"
     STORAGE_BOOSTED = "STORAGE_BOOSTED"
     STORAGE_ONLY = "STORAGE_ONLY"
@@ -140,9 +140,9 @@ class EMS:
             self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
 
-    def _enter_solar_surplus(self) -> None:
-        log.info("→ SOLAR_SURPLUS")
-        self.state = State.SOLAR_SURPLUS
+    def _enter_solar_only(self) -> None:
+        log.info("→ SOLAR_ONLY")
+        self.state = State.SOLAR_ONLY
         self._ema_discharge = None
         self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
@@ -236,7 +236,7 @@ class EMS:
         (minimal, normal, etc.) since we never assume P = I × V.
 
         grid_target: desired grid import in watts.
-          - SOLAR_SURPLUS: 0 (grid ≈ 0)
+          - SOLAR_ONLY: 0 (grid ≈ 0)
           - SOLAR_BOOSTED: ev_power * ratio (grid imports a share of EV)
         """
         excess = -(s["grid_power"] + s["battery_power"]) + grid_target
@@ -300,10 +300,10 @@ class EMS:
         if mode == "SOLAR_BOOSTED":
             surplus_state = State.SOLAR_BOOSTED
         else:
-            surplus_state = State.SOLAR_SURPLUS
+            surplus_state = State.SOLAR_ONLY
 
         # Hysteresis: stay in surplus unless SOC drops significantly
-        if self.state in (State.SOLAR_SURPLUS, State.SOLAR_BOOSTED):
+        if self.state in (State.SOLAR_ONLY, State.SOLAR_BOOSTED):
             if soc < (prio - config.SOC_HYSTERESIS_PCT):
                 return State.BATTERY_PRIORITY
             return surplus_state
@@ -327,8 +327,8 @@ class EMS:
             self._enter_ev_no_solar()
         elif target == State.BATTERY_PRIORITY:
             self._enter_battery_priority(s.get("ems_mode", "SOLAR_ONLY").upper())
-        elif target == State.SOLAR_SURPLUS:
-            self._enter_solar_surplus()
+        elif target == State.SOLAR_ONLY:
+            self._enter_solar_only()
         elif target == State.SOLAR_BOOSTED:
             self._enter_solar_boosted()
         elif target == State.STORAGE_BOOSTED:
@@ -383,14 +383,14 @@ class EMS:
                 self._last_slow_tick = now
                 self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
 
-        elif self.state == State.SOLAR_SURPLUS:
+        elif self.state == State.SOLAR_ONLY:
             now = time.monotonic()
             if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
                 self._last_slow_tick = now
                 amps = self._compute_wallbox_surplus(s, grid_target=0)
                 self._set_wallbox(amps)
                 log.info(
-                    "SURPLUS steering: grid=%.0fW  batt=%.0fW  ev=%.0fW → wallbox=%dA",
+                    "SOLAR_ONLY steering: grid=%.0fW  batt=%.0fW  ev=%.0fW → wallbox=%dA",
                     s["grid_power"], s["battery_power"], s["ev_power"], amps,
                 )
 
@@ -481,7 +481,7 @@ class EMS:
         self._set_grid_ratio(ratio_pct)
 
         # 4. Enforce batt_charge_limit across all states
-        if self.state in (State.SOLAR_SURPLUS, State.SOLAR_BOOSTED):
+        if self.state in (State.SOLAR_ONLY, State.SOLAR_BOOSTED):
             self._set_max_charging(config.SURPLUS_MAX_CHARGING_A)
         elif s["battery_soc"] >= s["batt_charge_limit"]:
             self._set_max_charging(0)
