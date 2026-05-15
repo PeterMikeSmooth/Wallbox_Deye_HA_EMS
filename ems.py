@@ -55,14 +55,14 @@ log = _setup_logging()
 # ---------------------------------------------------------------------------
 
 class State(enum.Enum):
-    IDLE = "IDLE"
-    FULL_SPEED = "FULL_SPEED"
-    EV_NO_SOLAR = "EV_NO_SOLAR"
-    BATTERY_PRIORITY = "BATTERY_PRIORITY"
-    SOLAR_ONLY = "SOLAR_ONLY"
-    SOLAR_BOOSTED = "SOLAR_BOOSTED"
-    STORAGE_BOOSTED = "STORAGE_BOOSTED"
-    STORAGE_ONLY = "STORAGE_ONLY"
+    IDLE = "IDLE"                        # Internal: no EV charging detected
+    FULL_SPEED = "FULL_SPEED"            # Mode: wallbox 32A, battery covers house
+    EV_NO_SOLAR = "EV_NO_SOLAR"          # Internal: no solar, wallbox 6A, discharge limited to house
+    BATTERY_PRIORITY = "BATTERY_PRIORITY"  # Internal: solar present but SOC < priority
+    SOLAR_ONLY = "SOLAR_ONLY"            # Mode: solar surplus → wallbox, grid ≈ 0
+    SOLAR_BOOSTED = "SOLAR_BOOSTED"      # Mode: wallbox boosted, grid pays 50-60% of EV
+    STORAGE_BOOSTED = "STORAGE_BOOSTED"  # Mode: battery discharge + grid pays 50-60%
+    STORAGE_ONLY = "STORAGE_ONLY"        # Mode: battery + solar → wallbox, grid = 0
 
 
 # ---------------------------------------------------------------------------
@@ -461,20 +461,30 @@ class EMS:
                 amps = self._compute_discharge_limit(s)
                 self._set_max_discharging(amps)
             else:
-                # Wallbox steering: target grid=0, battery discharges intentionally
-                # Pass grid_target=battery_power so battery cancels out of the
-                # excess formula: excess = -(grid+batt)+batt = -grid
+                # Direct calculation: wallbox = (max_discharge + solar - house) / voltage
+                # The Deye inverter keeps grid≈0 on its own, so the incremental
+                # algorithm cannot work (it always sees grid≈0 regardless of wallbox).
                 self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
                 now = time.monotonic()
                 if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
                     self._last_slow_tick = now
-                    amps = self._compute_wallbox_surplus(
-                        s, grid_target=s["battery_power"]
+                    house_load = (
+                        s["solar_power"] + s["battery_power"]
+                        + s["grid_power"] - s["ev_power"]
                     )
+                    available = (
+                        config.MAX_DISCHARGE_POWER_W
+                        + s["solar_power"]
+                        - max(house_load, 0)
+                    )
+                    amps = int(available / max(s["grid_voltage"], 1.0))
+                    amps = int(clamp(amps, config.WALLBOX_MIN_CURRENT_A, config.WALLBOX_MAX_CURRENT_A))
                     self._set_wallbox(amps)
                     log.info(
-                        "STORAGE_ONLY steering: grid=%.0fW batt=%.0fW ev=%.0fW solar=%.0fW → wallbox=%dA",
-                        s["grid_power"], s["battery_power"], s["ev_power"], s["solar_power"], amps,
+                        "STORAGE_ONLY steering: grid=%.0fW batt=%.0fW ev=%.0fW "
+                        "solar=%.0fW house=%.0fW avail=%.0fW → wallbox=%dA",
+                        s["grid_power"], s["battery_power"], s["ev_power"],
+                        s["solar_power"], house_load, available, amps,
                     )
 
         # 3. Update grid ratio indicator
