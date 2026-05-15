@@ -110,6 +110,7 @@ class EMS:
         self._storage_low_soc = False       # STORAGE_TO_EV: SOC below floor
         self._car_connected = False         # wallbox: car plugged in
         self._last_written_grid_ratio = None
+        self._battery_voltage = 52.0        # last known battery voltage
 
     # -- entry actions --------------------------------------------------------
 
@@ -186,12 +187,15 @@ class EMS:
         self.state = State.STORAGE_ONLY
         self._ema_discharge = None
         self._storage_low_soc = False
-        self._set_wallbox(config.STORAGE_ONLY_MAX_CURRENT_A)
+        self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
         self._last_slow_tick = time.monotonic()
 
     # -- write-with-dedup helpers ---------------------------------------------
 
     def _set_max_discharging(self, amps: int) -> None:
+        # Global cap: never exceed MAX_DISCHARGE_POWER_W
+        max_from_power = int(config.MAX_DISCHARGE_POWER_W / max(self._battery_voltage, 1.0))
+        amps = min(amps, max_from_power)
         if self._last_written_discharge != amps:
             self.ha.set_max_discharging_current(amps)
             log.info("SET max_discharging_current = %d A", amps)
@@ -373,6 +377,9 @@ class EMS:
     def tick(self, s: dict) -> None:
         """Called every fast-loop iteration with fresh sensor data *s*."""
 
+        # Update battery voltage for global discharge cap
+        self._battery_voltage = s.get("battery_voltage", self._battery_voltage)
+
         # 0. Detect car plug-in → reset mode to default
         car_connected = "connected" in s.get("wallbox_status", "").lower()
         if car_connected and not self._car_connected:
@@ -499,7 +506,7 @@ class EMS:
                 if soc >= config.STORAGE_TO_EV_SOC_FLOOR + 2:
                     self._storage_low_soc = False
                     log.info("STORAGE_ONLY: SOC recovered, resuming full discharge")
-                    self._set_wallbox(config.STORAGE_ONLY_MAX_CURRENT_A)
+                    self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
                     self._ema_discharge = None
             elif soc < config.STORAGE_TO_EV_SOC_FLOOR:
                 self._storage_low_soc = True
@@ -520,7 +527,7 @@ class EMS:
                 now = time.monotonic()
                 if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
                     self._last_slow_tick = now
-                    self._set_wallbox(config.STORAGE_ONLY_MAX_CURRENT_A)
+                    self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
 
         # 3. Update grid ratio indicator
         if s["ev_power"] > config.EV_CHARGING_DETECT_W:

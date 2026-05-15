@@ -37,8 +37,8 @@ STORAGE_BATT_RATIO_PEAK = 0.40      # Peak: battery 40%
 # SOLAR_BOOSTED_N_STORAGE: battery charge target while boosted
 STORAGE_CHARGE_W = 800               # Battery charge power in W
 
-# STORAGE_ONLY: battery covers house + EV (no grid)
-STORAGE_ONLY_MAX_CURRENT_A = 16      # Wallbox max current in STORAGE_ONLY
+# Global inverter protection: max discharge power
+MAX_DISCHARGE_POWER_W = 3600          # Never discharge more than 3.6 kW
 
 WALLBOX_MIN_CURRENT_A = 6
 WALLBOX_MAX_CURRENT_A = 32
