@@ -1,13 +1,11 @@
 """EMS — Energy Management System for Deye battery + Wallbox Pulsar Max.
 
-State machine with 9 states:
+State machine with 7 states:
   IDLE, FULL_SPEED, EV_NO_SOLAR, BATTERY_PRIORITY,
-  SOLAR_SURPLUS, SOLAR_BOOSTED, SOLAR_BOOSTED_N_STORAGE,
-  STORAGE_BOOSTED, STORAGE_ONLY.
+  SOLAR_SURPLUS, SOLAR_BOOSTED, STORAGE_BOOSTED, STORAGE_ONLY.
 
 Modes (input_select.ems_mode):
-  SOLAR_ONLY, SOLAR_BOOSTED, SOLAR_BOOSTED_N_STORAGE,
-  FULL_SPEED, STORAGE_BOOSTED, STORAGE_ONLY.
+  SOLAR_ONLY, SOLAR_BOOSTED, FULL_SPEED, STORAGE_BOOSTED, STORAGE_ONLY.
 
 See README.md for full specification.
 """
@@ -63,7 +61,6 @@ class State(enum.Enum):
     BATTERY_PRIORITY = "BATTERY_PRIORITY"
     SOLAR_SURPLUS = "SOLAR_SURPLUS"
     SOLAR_BOOSTED = "SOLAR_BOOSTED"
-    SOLAR_BOOSTED_N_STORAGE = "SOLAR_BOOSTED_N_STORAGE"
     STORAGE_BOOSTED = "STORAGE_BOOSTED"
     STORAGE_ONLY = "STORAGE_ONLY"
 
@@ -137,7 +134,7 @@ class EMS:
         self.state = State.BATTERY_PRIORITY
         self._ema_discharge = None
         # Boosted modes: never discharge battery even in BATTERY_PRIORITY
-        if mode in ("SOLAR_BOOSTED", "SOLAR_BOOSTED_N_STORAGE"):
+        if mode == "SOLAR_BOOSTED":
             self._set_max_discharging(0)
         else:
             self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
@@ -159,20 +156,6 @@ class EMS:
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
         self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
 
-    def _enter_solar_boosted_n_storage(self) -> None:
-        log.info("→ SOLAR_BOOSTED_N_STORAGE")
-        self.state = State.SOLAR_BOOSTED_N_STORAGE
-        self._ema_discharge = None
-        self._set_max_discharging(0)
-        self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
-        self._last_slow_tick = 0.0
-        try:
-            self.ha.set_switch("switch.deye_battery_grid_charging", True)
-            for i in range(1, 7):
-                self.ha.set_select(f"select.deye_program_{i}_charging", "Grid")
-            log.info("Enabled grid charging + ToU program slots")
-        except Exception:
-            log.warning("Failed to enable grid charging", exc_info=True)
 
     def _enter_storage_boosted(self) -> None:
         log.info("→ STORAGE_BOOSTED")
@@ -187,8 +170,9 @@ class EMS:
         self.state = State.STORAGE_ONLY
         self._ema_discharge = None
         self._storage_low_soc = False
-        self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
-        self._last_slow_tick = time.monotonic()
+        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
+        self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
 
     # -- write-with-dedup helpers ---------------------------------------------
 
@@ -304,7 +288,7 @@ class EMS:
         if mode == "STORAGE_ONLY":
             return State.STORAGE_ONLY
 
-        # SOLAR_ONLY / SOLAR_BOOSTED / SOLAR_BOOSTED_N_STORAGE share routing
+        # SOLAR_ONLY / SOLAR_BOOSTED share routing
         solar_available = s["solar_power"] > config.SOLAR_AVAILABLE_W
         if not solar_available:
             return State.EV_NO_SOLAR
@@ -315,13 +299,11 @@ class EMS:
         # Pick the right surplus state based on mode
         if mode == "SOLAR_BOOSTED":
             surplus_state = State.SOLAR_BOOSTED
-        elif mode == "SOLAR_BOOSTED_N_STORAGE":
-            surplus_state = State.SOLAR_BOOSTED_N_STORAGE
         else:
             surplus_state = State.SOLAR_SURPLUS
 
         # Hysteresis: stay in surplus unless SOC drops significantly
-        if self.state in (State.SOLAR_SURPLUS, State.SOLAR_BOOSTED, State.SOLAR_BOOSTED_N_STORAGE):
+        if self.state in (State.SOLAR_SURPLUS, State.SOLAR_BOOSTED):
             if soc < (prio - config.SOC_HYSTERESIS_PCT):
                 return State.BATTERY_PRIORITY
             return surplus_state
@@ -336,16 +318,6 @@ class EMS:
         if target == self.state:
             return
 
-        # Exit actions
-        if self.state == State.SOLAR_BOOSTED_N_STORAGE:
-            try:
-                self.ha.set_switch("switch.deye_battery_grid_charging", False)
-                for i in range(1, 7):
-                    self.ha.set_select(f"select.deye_program_{i}_charging", "Disabled")
-                log.info("Disabled grid charging + ToU program slots")
-            except Exception:
-                log.warning("Failed to disable grid charging", exc_info=True)
-
         # Enter target state
         if target == State.IDLE:
             self._enter_idle()
@@ -359,8 +331,6 @@ class EMS:
             self._enter_solar_surplus()
         elif target == State.SOLAR_BOOSTED:
             self._enter_solar_boosted()
-        elif target == State.SOLAR_BOOSTED_N_STORAGE:
-            self._enter_solar_boosted_n_storage()
         elif target == State.STORAGE_BOOSTED:
             self._enter_storage_boosted()
         elif target == State.STORAGE_ONLY:
@@ -441,35 +411,6 @@ class EMS:
                     grid_ratio * 100, "OFF-PEAK" if off_peak else "PEAK", amps,
                 )
 
-        elif self.state == State.SOLAR_BOOSTED_N_STORAGE:
-            now = time.monotonic()
-            if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
-                self._last_slow_tick = now
-                off_peak = is_off_peak()
-                grid_ratio = config.BOOSTED_GRID_RATIO_OFF_PEAK if off_peak else config.BOOSTED_GRID_RATIO_PEAK
-
-                # Allow battery to charge up to STORAGE_CHARGE_W
-                if s["battery_soc"] >= s["batt_charge_limit"]:
-                    self._set_max_charging(0)
-                else:
-                    batt_charge_a = int(config.STORAGE_CHARGE_W / max(s["battery_voltage"], 1.0))
-                    self._set_max_charging(batt_charge_a)
-
-                # Compensate grid_target by ACTUAL battery charge to keep grid_ratio on target
-                actual_batt_charge = max(-s["battery_power"], 0)
-                adjusted_target = s["ev_power"] * grid_ratio - actual_batt_charge
-                amps = self._compute_wallbox_surplus(
-                    s, grid_target=max(adjusted_target, 0)
-                )
-                self._set_wallbox(amps)
-                log.info(
-                    "BOOSTED+STORAGE steering: grid=%.0fW batt=%.0fW ev=%.0fW "
-                    "actual_charge=%.0fW grid_ratio=%.0f%% %s → wallbox=%dA",
-                    s["grid_power"], s["battery_power"], s["ev_power"],
-                    actual_batt_charge, grid_ratio * 100,
-                    "OFF-PEAK" if off_peak else "PEAK", amps,
-                )
-
         elif self.state == State.STORAGE_BOOSTED:
             soc = s["battery_soc"]
             # SOC floor with hysteresis (40% stop, 42% resume)
@@ -505,8 +446,8 @@ class EMS:
             if self._storage_low_soc:
                 if soc >= config.STORAGE_TO_EV_SOC_FLOOR + 2:
                     self._storage_low_soc = False
-                    log.info("STORAGE_ONLY: SOC recovered, resuming full discharge")
-                    self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
+                    log.info("STORAGE_ONLY: SOC recovered, resuming")
+                    self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
                     self._ema_discharge = None
             elif soc < config.STORAGE_TO_EV_SOC_FLOOR:
                 self._storage_low_soc = True
@@ -516,18 +457,21 @@ class EMS:
                 self._ema_discharge = None
 
             if self._storage_low_soc:
-                # Battery covers house only (same algo as EV_NO_SOLAR)
+                # Battery covers house only
                 amps = self._compute_discharge_limit(s)
                 self._set_max_discharging(amps)
             else:
-                # Battery covers everything: grid_ratio=0 → grid ≈ 0
-                amps = self._compute_storage_discharge(s, grid_ratio=0)
-                self._set_max_discharging(amps)
-                # Re-send wallbox periodically (cloud may override)
+                # Wallbox steering: grid_target=0 → consume only solar+battery
+                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
                 now = time.monotonic()
                 if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
                     self._last_slow_tick = now
-                    self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
+                    amps = self._compute_wallbox_surplus(s, grid_target=0)
+                    self._set_wallbox(amps)
+                    log.info(
+                        "STORAGE_ONLY steering: grid=%.0fW batt=%.0fW ev=%.0fW solar=%.0fW → wallbox=%dA",
+                        s["grid_power"], s["battery_power"], s["ev_power"], s["solar_power"], amps,
+                    )
 
         # 3. Update grid ratio indicator
         if s["ev_power"] > config.EV_CHARGING_DETECT_W:
@@ -539,8 +483,6 @@ class EMS:
         # 4. Enforce batt_charge_limit across all states
         if self.state in (State.SOLAR_SURPLUS, State.SOLAR_BOOSTED):
             self._set_max_charging(config.SURPLUS_MAX_CHARGING_A)
-        elif self.state == State.SOLAR_BOOSTED_N_STORAGE:
-            pass  # charging managed in tick block above
         elif s["battery_soc"] >= s["batt_charge_limit"]:
             self._set_max_charging(0)
         else:

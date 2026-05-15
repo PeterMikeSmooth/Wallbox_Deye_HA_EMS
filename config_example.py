@@ -34,9 +34,6 @@ BOOSTED_GRID_RATIO_PEAK = 0.60      # Peak: grid 60%, solar 40%
 STORAGE_BATT_RATIO_OFF_PEAK = 0.50  # Off-peak: battery 50%
 STORAGE_BATT_RATIO_PEAK = 0.40      # Peak: battery 40%
 
-# SOLAR_BOOSTED_N_STORAGE: battery charge target while boosted
-STORAGE_CHARGE_W = 800               # Battery charge power in W
-
 # Global inverter protection: max discharge power
 MAX_DISCHARGE_POWER_W = 3600          # Never discharge more than 3.6 kW
 
