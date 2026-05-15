@@ -461,12 +461,16 @@ class EMS:
                 amps = self._compute_discharge_limit(s)
                 self._set_max_discharging(amps)
             else:
-                # Wallbox steering: grid_target=0 → consume only solar+battery
+                # Wallbox steering: target grid=0, battery discharges intentionally
+                # Pass grid_target=battery_power so battery cancels out of the
+                # excess formula: excess = -(grid+batt)+batt = -grid
                 self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
                 now = time.monotonic()
                 if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
                     self._last_slow_tick = now
-                    amps = self._compute_wallbox_surplus(s, grid_target=0)
+                    amps = self._compute_wallbox_surplus(
+                        s, grid_target=s["battery_power"]
+                    )
                     self._set_wallbox(amps)
                     log.info(
                         "STORAGE_ONLY steering: grid=%.0fW batt=%.0fW ev=%.0fW solar=%.0fW → wallbox=%dA",
