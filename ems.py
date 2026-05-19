@@ -108,6 +108,9 @@ class EMS:
         self._car_connected = False         # wallbox: car plugged in
         self._last_written_grid_ratio = None
         self._battery_voltage = 52.0        # last known battery voltage
+        # Wallbox override detection
+        self._wallbox_override_since = None  # timestamp when override first detected
+        self._wallbox_override_retries = 0   # number of toggle retries attempted
 
     # -- entry actions --------------------------------------------------------
 
@@ -267,6 +270,58 @@ class EMS:
             )
 
         return int(clamp(round(self._ema_discharge), 0, 100))
+
+    # -- wallbox override protection ------------------------------------------
+
+    _OVERRIDE_THRESHOLD_W = 1500  # ev_power must exceed expected by this much
+    _OVERRIDE_CONFIRM_S = 120     # seconds before triggering a retry
+
+    def _check_wallbox_override(self, s: dict) -> None:
+        """Detect when wallbox ignores our current setpoint and toggle retry."""
+        if self._last_written_wallbox is None:
+            return
+
+        expected_w = self._last_written_wallbox * max(s["grid_voltage"], 1.0)
+        actual_w = s["ev_power"]
+        overshoot = actual_w - expected_w
+
+        if overshoot > self._OVERRIDE_THRESHOLD_W:
+            now = time.monotonic()
+            if self._wallbox_override_since is None:
+                self._wallbox_override_since = now
+                log.warning(
+                    "WALLBOX OVERRIDE DETECTED: setpoint=%dA (%.0fW expected) "
+                    "but ev_power=%.0fW (overshoot=+%.0fW). Monitoring...",
+                    self._last_written_wallbox, expected_w, actual_w, overshoot,
+                )
+            elif now - self._wallbox_override_since >= self._OVERRIDE_CONFIRM_S:
+                # Confirmed override — toggle to force cloud update
+                self._wallbox_override_retries += 1
+                target = self._last_written_wallbox
+                log.warning(
+                    "WALLBOX OVERRIDE RETRY #%d: toggling %dA → %dA → %dA "
+                    "(ev_power=%.0fW, expected=%.0fW)",
+                    self._wallbox_override_retries,
+                    target, target + 1, target,
+                    actual_w, expected_w,
+                )
+                # Send target+1, then target to force a state change
+                self.ha.set_wallbox_current(target + 1)
+                time.sleep(2)
+                self.ha.set_wallbox_current(target)
+                # Reset timer to wait another confirmation period
+                self._wallbox_override_since = time.monotonic()
+        else:
+            # No override — reset detection
+            if self._wallbox_override_since is not None:
+                if self._wallbox_override_retries > 0:
+                    log.info(
+                        "WALLBOX OVERRIDE RESOLVED after %d retries "
+                        "(ev_power=%.0fW, expected=%.0fW)",
+                        self._wallbox_override_retries, actual_w, expected_w,
+                    )
+                self._wallbox_override_since = None
+                self._wallbox_override_retries = 0
 
     # -- state evaluation -----------------------------------------------------
 
@@ -501,6 +556,9 @@ class EMS:
             self._set_max_charging(0)
         else:
             self._set_max_charging(config.DEFAULT_MAX_CHARGING_CURRENT_A)
+
+        # 5. Wallbox override detection: wallbox ignoring our setpoint
+        self._check_wallbox_override(s)
 
 
 # ---------------------------------------------------------------------------
