@@ -119,6 +119,7 @@ class EMS:
         self.state = State.IDLE
         self._ema_discharge = None
         self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
 
     def _enter_full_speed(self) -> None:
         log.info("→ FULL_SPEED")
