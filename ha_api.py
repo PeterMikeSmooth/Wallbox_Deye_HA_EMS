@@ -15,6 +15,7 @@ SENSOR_GRID_VOLTAGE = "sensor.deye_load_l1_voltage"
 SENSOR_EV_POWER = "sensor.shellyem_34945478aee1_channel_2_power"
 SENSOR_BATT_CHARGE_LIMIT = "input_number.batt_charge_limit"
 SENSOR_BATT_CHARGE_PRIO = "input_number.batt_charge_prio"
+SENSOR_DISCHARGE_LIMIT = "input_number.discharge_limit"
 SENSOR_EMS_MODE = "input_select.ems_mode"
 SENSOR_WALLBOX_STATUS = "sensor.wallbox_pulsar_max_sn_429953_status_description"
 INPUT_EMS_STATE = "input_text.ems_state"
@@ -67,6 +68,7 @@ class HomeAssistantAPI:
             "grid_voltage": self.get_state(SENSOR_GRID_VOLTAGE),
             "batt_charge_limit": self.get_state(SENSOR_BATT_CHARGE_LIMIT),
             "batt_charge_prio": self.get_state(SENSOR_BATT_CHARGE_PRIO),
+            "discharge_limit": self.get_state(SENSOR_DISCHARGE_LIMIT),
             "ems_mode": self.get_text_state(SENSOR_EMS_MODE),
             "wallbox_status": self.get_text_state(SENSOR_WALLBOX_STATUS),
         }
