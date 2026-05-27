@@ -427,12 +427,9 @@ class EMS:
             self._set_max_discharging(amps)
 
         elif self.state == State.FULL_SPEED:
-            if s["solar_power"] > config.SOLAR_AVAILABLE_W:
-                self._set_max_discharging(0)
-                self._ema_discharge = None
-            else:
-                amps = self._compute_discharge_limit(s)
-                self._set_max_discharging(amps)
+            # Battery covers house deficit so grid only pays for EV
+            amps = self._compute_discharge_limit(s)
+            self._set_max_discharging(amps)
             # Re-send wallbox 32A periodically (cloud may override)
             now = time.monotonic()
             if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
