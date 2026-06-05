@@ -20,6 +20,7 @@ SENSOR_EMS_MODE = "input_select.ems_mode"
 SENSOR_WALLBOX_STATUS = "sensor.wallbox_pulsar_max_sn_429953_status_description"
 INPUT_EMS_STATE = "input_text.ems_state"
 INPUT_GRID_RATIO = "input_number.grid_ratio_value"
+INPUT_RANGE_NEEDED = "input_number.range_needed_over_night"
 
 NUMBER_MAX_CHARGING_CURRENT = "number.deye_battery_max_charging_current"
 NUMBER_MAX_DISCHARGING_CURRENT = "number.deye_battery_max_discharging_current"
