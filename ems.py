@@ -189,8 +189,9 @@ class EMS:
     # -- write-with-dedup helpers ---------------------------------------------
 
     def _set_max_discharging(self, amps: int) -> None:
-        # Global cap: only apply MAX_DISCHARGE_POWER_W when EV is NOT charging
-        if self.state == State.IDLE:
+        # Global cap: apply MAX_DISCHARGE_POWER_W only when EV is charging
+        # (long sustained discharge → inverter heating). Transient house loads are fine.
+        if self.state != State.IDLE:
             max_from_power = int(config.MAX_DISCHARGE_POWER_W / max(self._battery_voltage, 1.0))
             amps = min(amps, max_from_power)
         if self._last_written_discharge != amps:
