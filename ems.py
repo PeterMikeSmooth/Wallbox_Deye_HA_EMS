@@ -115,6 +115,10 @@ class EMS:
         self._solar_was_available = False     # was solar > threshold last tick
         self._soc_at_dusk = None              # SOC % when solar dropped below threshold
         self._sunrise_computed = False        # already computed today's sunrise values
+        # Force safe wallbox default on startup
+        self.ha.set_wallbox_current(config.WALLBOX_MIN_CURRENT_A)
+        self._last_written_wallbox = config.WALLBOX_MIN_CURRENT_A
+        log.info("SET wallbox_current = %d A (startup)", config.WALLBOX_MIN_CURRENT_A)
 
     # -- entry actions --------------------------------------------------------
 
@@ -279,7 +283,7 @@ class EMS:
     # -- wallbox override protection ------------------------------------------
 
     _OVERRIDE_THRESHOLD_W = 1500  # ev_power must exceed expected by this much
-    _OVERRIDE_CONFIRM_S = 120     # seconds before triggering a retry
+    _OVERRIDE_CONFIRM_S = 30      # seconds before triggering a retry
 
     def _check_wallbox_override(self, s: dict) -> None:
         """Detect when wallbox ignores our current setpoint and toggle retry."""
@@ -317,8 +321,9 @@ class EMS:
                 # Reset timer to wait another confirmation period
                 self._wallbox_override_since = time.monotonic()
         else:
-            # No override — reset detection
-            if self._wallbox_override_since is not None:
+            # No override — reset detection only if EV is actually at expected level
+            # Don't reset during IDLE (EV power may temporarily drop during handshake)
+            if self._wallbox_override_since is not None and self.state != State.IDLE:
                 if self._wallbox_override_retries > 0:
                     log.info(
                         "WALLBOX OVERRIDE RESOLVED after %d retries "
