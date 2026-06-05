@@ -189,9 +189,10 @@ class EMS:
     # -- write-with-dedup helpers ---------------------------------------------
 
     def _set_max_discharging(self, amps: int) -> None:
-        # Global cap: never exceed MAX_DISCHARGE_POWER_W
-        max_from_power = int(config.MAX_DISCHARGE_POWER_W / max(self._battery_voltage, 1.0))
-        amps = min(amps, max_from_power)
+        # Global cap: only apply MAX_DISCHARGE_POWER_W when EV is NOT charging
+        if self.state == State.IDLE:
+            max_from_power = int(config.MAX_DISCHARGE_POWER_W / max(self._battery_voltage, 1.0))
+            amps = min(amps, max_from_power)
         if self._last_written_discharge != amps:
             self.ha.set_max_discharging_current(amps)
             log.info("SET max_discharging_current = %d A", amps)
