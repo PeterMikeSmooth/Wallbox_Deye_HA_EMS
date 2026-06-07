@@ -388,12 +388,12 @@ class EMS:
             return State.FULL_SPEED
 
         if mode == "STORAGE_BOOSTED":
-            if s["battery_soc"] < s["discharge_limit"]:
+            if s["battery_soc"] <= s["discharge_limit"]:
                 return State.SOLAR_ONLY if s["solar_power"] > config.SOLAR_AVAILABLE_W else State.EV_NO_SOLAR
             return State.STORAGE_BOOSTED
 
         if mode == "STORAGE_ONLY":
-            if s["battery_soc"] < s["discharge_limit"]:
+            if s["battery_soc"] <= s["discharge_limit"]:
                 return State.SOLAR_ONLY if s["solar_power"] > config.SOLAR_AVAILABLE_W else State.EV_NO_SOLAR
             return State.STORAGE_ONLY
 
