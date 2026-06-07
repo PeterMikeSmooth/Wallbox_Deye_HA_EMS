@@ -389,11 +389,17 @@ class EMS:
 
         if mode == "STORAGE_BOOSTED":
             if s["battery_soc"] <= s["discharge_limit"]:
+                self.ha.set_ems_mode("SOLAR_ONLY")
+                s["ems_mode"] = "SOLAR_ONLY"
+                log.info("SOC <= discharge_limit — forcing ems_mode to SOLAR_ONLY")
                 return State.SOLAR_ONLY if s["solar_power"] > config.SOLAR_AVAILABLE_W else State.EV_NO_SOLAR
             return State.STORAGE_BOOSTED
 
         if mode == "STORAGE_ONLY":
             if s["battery_soc"] <= s["discharge_limit"]:
+                self.ha.set_ems_mode("SOLAR_ONLY")
+                s["ems_mode"] = "SOLAR_ONLY"
+                log.info("SOC <= discharge_limit — forcing ems_mode to SOLAR_ONLY")
                 return State.SOLAR_ONLY if s["solar_power"] > config.SOLAR_AVAILABLE_W else State.EV_NO_SOLAR
             return State.STORAGE_ONLY
 
