@@ -35,7 +35,7 @@ STORAGE_BATT_RATIO_OFF_PEAK = 0.50  # Off-peak: battery 50%
 STORAGE_BATT_RATIO_PEAK = 0.40      # Peak: battery 40%
 
 # Global inverter protection: max discharge power
-MAX_DISCHARGE_POWER_W = 3600          # Never discharge more than 3.6 kW (inverter hardware limit ~68A)
+MAX_DISCHARGE_POWER_W = 4600          # Never discharge more than 4.6 kW
 
 WALLBOX_MIN_CURRENT_A = 6
 WALLBOX_MAX_CURRENT_A = 32
