@@ -486,13 +486,12 @@ class EMS:
             self._set_max_discharging(amps)
 
         elif self.state == State.FULL_SPEED:
-            if s["battery_soc"] >= s["discharge_limit"]:
-                # Above discharge_limit: battery at max (3.6kW cap) for EV + house
-                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+            if s["battery_soc"] <= s["discharge_limit"]:
+                # At or below discharge_limit: no discharge at all
+                self._set_max_discharging(0)
             else:
-                # Below discharge_limit: battery covers house only
-                amps = self._compute_discharge_limit(s)
-                self._set_max_discharging(amps)
+                # Above discharge_limit: battery at max (4.6kW cap) for EV + house
+                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
             # Re-send wallbox 32A periodically (cloud may override)
             now = time.monotonic()
             if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
