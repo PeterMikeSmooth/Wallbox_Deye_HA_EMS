@@ -523,16 +523,16 @@ class EMS:
 
         elif self.state == State.STORAGE_BOOSTED:
             soc = s["battery_soc"]
-            # SOC floor with hysteresis (40% stop, 42% resume)
+            soc_floor = s["discharge_limit"]
+            # SOC floor with hysteresis (floor stop, floor+2 resume)
             if self._storage_low_soc:
-                if soc >= config.STORAGE_TO_EV_SOC_FLOOR + 2:
+                if soc >= soc_floor + 2:
                     self._storage_low_soc = False
                     log.info("STORAGE_BOOSTED: SOC recovered above floor, resuming")
-                    self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
-            elif soc < config.STORAGE_TO_EV_SOC_FLOOR:
+            elif soc < soc_floor:
                 self._storage_low_soc = True
                 log.info("STORAGE_BOOSTED: SOC below %.0f%%, stopping",
-                         config.STORAGE_TO_EV_SOC_FLOOR)
+                         soc_floor)
                 self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
                 self._set_max_discharging(0)
                 self._ema_discharge = None
@@ -552,17 +552,18 @@ class EMS:
 
         elif self.state == State.STORAGE_ONLY:
             soc = s["battery_soc"]
-            # SOC floor with hysteresis (40% stop, 42% resume)
+            soc_floor = s["discharge_limit"]
+            # SOC floor with hysteresis (floor stop, floor+2 resume)
             if self._storage_low_soc:
-                if soc >= config.STORAGE_TO_EV_SOC_FLOOR + 2:
+                if soc >= soc_floor + 2:
                     self._storage_low_soc = False
                     log.info("STORAGE_ONLY: SOC recovered, resuming")
                     self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
                     self._ema_discharge = None
-            elif soc < config.STORAGE_TO_EV_SOC_FLOOR:
+            elif soc < soc_floor:
                 self._storage_low_soc = True
                 log.info("STORAGE_ONLY: SOC below %.0f%%, house only",
-                         config.STORAGE_TO_EV_SOC_FLOOR)
+                         soc_floor)
                 self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
                 self._ema_discharge = None
 
