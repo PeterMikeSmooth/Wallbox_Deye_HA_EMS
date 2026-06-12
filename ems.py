@@ -114,6 +114,7 @@ class EMS:
         # Dusk/sunrise tracking for overnight range calculation
         self._solar_was_available = False     # was solar > threshold last tick
         self._solar_available_count = 0       # consecutive ticks with solar available
+        self._solar_unavailable_count = 0     # consecutive ticks without solar (darkness)
         self._soc_at_dusk = None              # SOC % when solar dropped below threshold
         self._sunrise_computed = False        # already computed today's sunrise values
         # Force safe wallbox default on startup
@@ -341,6 +342,7 @@ class EMS:
     _MIN_SOC_LFP = 20  # Minimum safe SOC for LFP battery (%)
     _SAFETY_MARGIN = 10  # Extra margin above overnight need (%)
     _MIN_SOLAR_TICKS_FOR_DUSK = 1800  # 30 min at 1s/tick before dusk is valid
+    _MIN_DARK_TICKS_FOR_SUNRISE = 1800  # 30 min at 1s/tick of darkness before sunrise is valid
 
     def _track_overnight_range(self, s: dict) -> None:
         """Track SOC at dusk, compute overnight need at sunrise."""
@@ -360,8 +362,13 @@ class EMS:
                           self._solar_available_count, self._MIN_SOLAR_TICKS_FOR_DUSK)
 
         # Sunrise: solar just appeared → compute overnight range
+        # Only valid after a real night (darkness for at least 30 min), so that
+        # solar oscillation around the threshold at dusk cannot trigger a false sunrise.
         if not self._solar_was_available and solar_available and not self._sunrise_computed:
-            if self._soc_at_dusk is not None:
+            if self._solar_unavailable_count < self._MIN_DARK_TICKS_FOR_SUNRISE:
+                log.debug("Solar back after only %d dark ticks — ignoring (need %d)",
+                          self._solar_unavailable_count, self._MIN_DARK_TICKS_FOR_SUNRISE)
+            elif self._soc_at_dusk is not None:
                 range_needed = self._soc_at_dusk - soc
                 range_needed = max(range_needed, 0)
                 target = self._MIN_SOC_LFP + range_needed + self._SAFETY_MARGIN
@@ -377,13 +384,15 @@ class EMS:
                     self.ha.set_input_number("input_number.discharge_limit", target)
                 except Exception:
                     log.warning("Failed to set overnight range helpers", exc_info=True)
-            self._sunrise_computed = True
+                self._sunrise_computed = True
 
-        # Update solar availability counter
+        # Update solar availability counters
         if solar_available:
             self._solar_available_count += 1
+            self._solar_unavailable_count = 0
         else:
             self._solar_available_count = 0
+            self._solar_unavailable_count += 1
 
         self._solar_was_available = solar_available
 
