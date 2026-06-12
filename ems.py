@@ -111,12 +111,10 @@ class EMS:
         # Wallbox override detection
         self._wallbox_override_since = None  # timestamp when override first detected
         self._wallbox_override_retries = 0   # number of toggle retries attempted
-        # Dusk/sunrise tracking for overnight range calculation
-        self._solar_was_available = False     # was solar > threshold last tick
-        self._solar_available_count = 0       # consecutive ticks with solar available
-        self._solar_unavailable_count = 0     # consecutive ticks without solar (darkness)
-        self._soc_at_dusk = None              # SOC % when solar dropped below threshold
-        self._sunrise_computed = False        # already computed today's sunrise values
+        # Overnight range tracking — two-phase state machine (see _track_overnight_range)
+        self._overnight_phase = "WAIT_FOR_NIGHT"  # WAIT_FOR_NIGHT | WAIT_FOR_DAYLIGHT
+        self._soc_overnight_start = None          # SOC captured at dusk (last sub-threshold crossing)
+        self._solar_was_available = True          # previous tick solar state (for edge detection)
         # Force safe wallbox default on startup
         self.ha.set_wallbox_current(config.WALLBOX_MIN_CURRENT_A)
         self._last_written_wallbox = config.WALLBOX_MIN_CURRENT_A
@@ -341,42 +339,53 @@ class EMS:
 
     _MIN_SOC_LFP = 20  # Minimum safe SOC for LFP battery (%)
     _SAFETY_MARGIN = 10  # Extra margin above overnight need (%)
-    _MIN_SOLAR_TICKS_FOR_DUSK = 1800  # 30 min at 1s/tick before dusk is valid
-    _MIN_DARK_TICKS_FOR_SUNRISE = 1800  # 30 min at 1s/tick of darkness before sunrise is valid
+    _PREDAWN_HOUR = 1  # local hour: lock dusk SOC and start watching for daylight
 
     def _track_overnight_range(self, s: dict) -> None:
-        """Track SOC at dusk, compute overnight need at sunrise."""
+        """Compute overnight battery drain with a two-phase state machine.
+
+        WAIT_FOR_NIGHT:
+            Capture the SOC only on the falling edge (solar crossing below the
+            threshold) — i.e. at dusk, not continuously through the night, so the
+            value reflects the SOC at sunset rather than the depleted pre-dawn SOC.
+            Dusk oscillation re-captures values near sunset (harmless); daytime
+            cloud dips get overwritten by later edges, so the last edge before
+            01:00 is the real sunset. At 01:00, switch to WAIT_FOR_DAYLIGHT.
+
+        WAIT_FOR_DAYLIGHT:
+            The first time solar exceeds the threshold (real sunrise), compute
+            range_needed = soc_dusk - soc_now, update the HA helpers, and switch
+            back to WAIT_FOR_NIGHT.
+
+        Robust against solar dropping out and returning for >30 min: daylight is
+        only ever evaluated after 01:00, and the first crossing ends the phase,
+        so dawn oscillation cannot reset range_needed_over_night.
+        """
         solar_available = s["solar_power"] > config.SOLAR_AVAILABLE_W
         soc = s["battery_soc"]
+        hour = datetime.now().hour
 
-        # Dusk: solar just dropped below threshold → record SOC
-        # Only valid if solar was stable for at least 30 min (avoids dawn oscillation)
-        if self._solar_was_available and not solar_available:
-            if self._solar_available_count >= self._MIN_SOLAR_TICKS_FOR_DUSK:
-                self._soc_at_dusk = soc
-                self._sunrise_computed = False
-                log.info("DUSK: solar lost after %d ticks, recording SOC at dusk = %.0f%%",
-                         self._solar_available_count, soc)
-            else:
-                log.debug("Solar lost after only %d ticks — ignoring (need %d)",
-                          self._solar_available_count, self._MIN_SOLAR_TICKS_FOR_DUSK)
-
-        # Sunrise: solar just appeared → compute overnight range
-        # Only valid after a real night (darkness for at least 30 min), so that
-        # solar oscillation around the threshold at dusk cannot trigger a false sunrise.
-        if not self._solar_was_available and solar_available and not self._sunrise_computed:
-            if self._solar_unavailable_count < self._MIN_DARK_TICKS_FOR_SUNRISE:
-                log.debug("Solar back after only %d dark ticks — ignoring (need %d)",
-                          self._solar_unavailable_count, self._MIN_DARK_TICKS_FOR_SUNRISE)
-            elif self._soc_at_dusk is not None:
-                range_needed = self._soc_at_dusk - soc
-                range_needed = max(range_needed, 0)
-                target = self._MIN_SOC_LFP + range_needed + self._SAFETY_MARGIN
-                target = min(target, 100)
+        if self._overnight_phase == "WAIT_FOR_NIGHT":
+            # Falling edge: solar just dropped below threshold → record dusk SOC.
+            if self._solar_was_available and not solar_available:
+                self._soc_overnight_start = soc
+                log.info("DUSK: solar dropped below threshold, SOC at dusk = %.0f%%", soc)
+            # At 01:00, lock in the dusk SOC and wait for sunrise.
+            if hour == self._PREDAWN_HOUR and self._soc_overnight_start is not None:
+                self._overnight_phase = "WAIT_FOR_DAYLIGHT"
                 log.info(
-                    "SUNRISE: SOC dusk=%.0f%% now=%.0f%% → range_needed=%.0f%% "
+                    "OVERNIGHT: pre-dawn reached — SOC at dusk = %.0f%%, "
+                    "waiting for daylight", self._soc_overnight_start,
+                )
+
+        elif self._overnight_phase == "WAIT_FOR_DAYLIGHT":
+            if solar_available:
+                range_needed = max(self._soc_overnight_start - soc, 0)
+                target = min(self._MIN_SOC_LFP + range_needed + self._SAFETY_MARGIN, 100)
+                log.info(
+                    "DAYLIGHT: SOC dusk=%.0f%% now=%.0f%% → range_needed=%.0f%% "
                     "→ setting batt_charge_prio=%.0f%% discharge_limit=%.0f%%",
-                    self._soc_at_dusk, soc, range_needed, target, target,
+                    self._soc_overnight_start, soc, range_needed, target, target,
                 )
                 try:
                     self.ha.set_input_number("input_number.range_needed_over_night", range_needed)
@@ -384,15 +393,7 @@ class EMS:
                     self.ha.set_input_number("input_number.discharge_limit", target)
                 except Exception:
                     log.warning("Failed to set overnight range helpers", exc_info=True)
-                self._sunrise_computed = True
-
-        # Update solar availability counters
-        if solar_available:
-            self._solar_available_count += 1
-            self._solar_unavailable_count = 0
-        else:
-            self._solar_available_count = 0
-            self._solar_unavailable_count += 1
+                self._overnight_phase = "WAIT_FOR_NIGHT"
 
         self._solar_was_available = solar_available
 
