@@ -1,11 +1,11 @@
 """EMS — Energy Management System for Deye battery + Wallbox Pulsar Max.
 
-State machine with 7 states:
+State machine with states:
   IDLE, FULL_SPEED, EV_NO_SOLAR, BATTERY_PRIORITY,
-  SOLAR_ONLY, SOLAR_BOOSTED, STORAGE_BOOSTED, STORAGE_ONLY.
+  SOLAR_ONLY, SOLAR_BOOSTED, STORAGE_BOOSTED, STORAGE_ONLY, MANUAL.
 
 Modes (input_select.ems_mode):
-  SOLAR_ONLY, SOLAR_BOOSTED, FULL_SPEED, STORAGE_BOOSTED, STORAGE_ONLY.
+  SOLAR_ONLY, SOLAR_BOOSTED, FULL_SPEED, STORAGE_BOOSTED, STORAGE_ONLY, MANUAL.
 
 See README.md for full specification.
 """
@@ -63,6 +63,7 @@ class State(enum.Enum):
     SOLAR_BOOSTED = "SOLAR_BOOSTED"      # Mode: wallbox boosted, grid pays 50-60% of EV
     STORAGE_BOOSTED = "STORAGE_BOOSTED"  # Mode: battery discharge + grid pays 50-60%
     STORAGE_ONLY = "STORAGE_ONLY"        # Mode: battery + solar → wallbox, grid = 0
+    MANUAL = "MANUAL"                    # Mode: user sets wallbox current; EMS only manages battery
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +186,16 @@ class EMS:
         self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
         self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
+
+    def _enter_manual(self) -> None:
+        # User controls wallbox current from the app; EMS starts it at 6A then
+        # hands off (never touches wallbox current again while in MANUAL).
+        log.info("→ MANUAL")
+        self.state = State.MANUAL
+        self._ema_discharge = None
+        self._storage_low_soc = False
+        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
 
     # -- write-with-dedup helpers ---------------------------------------------
 
@@ -411,6 +422,9 @@ class EMS:
         if mode == "FULL_SPEED":
             return State.FULL_SPEED
 
+        if mode == "MANUAL":
+            return State.MANUAL
+
         if mode == "STORAGE_BOOSTED":
             if s["battery_soc"] <= s["discharge_limit"]:
                 self.ha.set_ems_mode("SOLAR_ONLY")
@@ -457,6 +471,11 @@ class EMS:
         if target == self.state:
             return
 
+        # Leaving MANUAL: reset wallbox to 6A so it never stays stuck on the
+        # user's manual setpoint (the target state's entry may override this).
+        if self.state == State.MANUAL and target != State.MANUAL:
+            self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
+
         # Enter target state
         if target == State.IDLE:
             self._enter_idle()
@@ -474,6 +493,8 @@ class EMS:
             self._enter_storage_boosted()
         elif target == State.STORAGE_ONLY:
             self._enter_storage_only()
+        elif target == State.MANUAL:
+            self._enter_manual()
 
         # Update HA with current state
         try:
@@ -628,6 +649,29 @@ class EMS:
                         s["solar_power"], house_load, available, amps,
                     )
 
+        elif self.state == State.MANUAL:
+            # Wallbox current is user-controlled — never touched here.
+            # Battery: discharge normally to support the EV while SOC is above
+            # discharge_limit; below it, cover the house only (no EV discharge).
+            soc = s["battery_soc"]
+            soc_floor = s["discharge_limit"]
+            # SOC floor with hysteresis (floor stop, floor+2 resume)
+            if self._storage_low_soc:
+                if soc >= soc_floor + 2:
+                    self._storage_low_soc = False
+                    log.info("MANUAL: SOC recovered above floor, resuming battery support")
+                    self._ema_discharge = None
+            elif soc < soc_floor:
+                self._storage_low_soc = True
+                log.info("MANUAL: SOC below %.0f%%, house only", soc_floor)
+                self._ema_discharge = None
+
+            if self._storage_low_soc:
+                amps = self._compute_discharge_limit(s)
+                self._set_max_discharging(amps)
+            else:
+                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+
         # 3. Update grid ratio indicator
         if s["ev_power"] > config.EV_CHARGING_DETECT_W:
             ratio_pct = int(clamp(round(s["grid_power"] / s["ev_power"] * 100), 0, 100))
@@ -643,8 +687,11 @@ class EMS:
         else:
             self._set_max_charging(config.DEFAULT_MAX_CHARGING_CURRENT_A)
 
-        # 5. Wallbox override detection: wallbox ignoring our setpoint
-        self._check_wallbox_override(s)
+        # 5. Wallbox override detection: wallbox ignoring our setpoint.
+        # Skip in MANUAL — the user deliberately sets the current from the app,
+        # so a higher ev_power is expected, not a cloud override to fight.
+        if self.state != State.MANUAL:
+            self._check_wallbox_override(s)
 
         # 6. Dusk/sunrise tracking for overnight range
         self._track_overnight_range(s)
