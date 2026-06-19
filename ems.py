@@ -135,7 +135,6 @@ class EMS:
         self.state = State.FULL_SPEED
         self._ema_discharge = None
         self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
-        self._last_slow_tick = time.monotonic()
 
     def _enter_ev_no_solar(self) -> None:
         log.info("→ EV_NO_SOLAR")
@@ -538,11 +537,7 @@ class EMS:
                 # At or below discharge_limit: battery covers house only
                 amps = self._compute_discharge_limit(s)
                 self._set_max_discharging(amps)
-            # Re-send wallbox 32A periodically (cloud may override)
-            now = time.monotonic()
-            if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
-                self._last_slow_tick = now
-                self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
+            # Wallbox is set to 32A on entry; user may adjust manually and it will stick.
 
         elif self.state == State.SOLAR_ONLY:
             now = time.monotonic()
