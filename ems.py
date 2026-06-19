@@ -652,7 +652,8 @@ class EMS:
         elif self.state == State.MANUAL:
             # Wallbox current is user-controlled — never touched here.
             # Battery: discharge normally to support the EV while SOC is above
-            # discharge_limit; below it, cover the house only (no EV discharge).
+            # discharge_limit; below it, hands off the Deye discharge current too
+            # so the user can set it manually via the Deye control in HA.
             soc = s["battery_soc"]
             soc_floor = s["discharge_limit"]
             # SOC floor with hysteresis (floor stop, floor+2 resume)
@@ -663,13 +664,13 @@ class EMS:
                     self._ema_discharge = None
             elif soc < soc_floor:
                 self._storage_low_soc = True
-                log.info("MANUAL: SOC below %.0f%%, house only", soc_floor)
+                log.info("MANUAL: SOC below %.0f%%, discharge under manual Deye control",
+                         soc_floor)
                 self._ema_discharge = None
+                # Forget last written value so a future resume always re-writes
+                self._last_written_discharge = None
 
-            if self._storage_low_soc:
-                amps = self._compute_discharge_limit(s)
-                self._set_max_discharging(amps)
-            else:
+            if not self._storage_low_soc:
                 self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
 
         # 3. Update grid ratio indicator
