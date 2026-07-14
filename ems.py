@@ -533,8 +533,13 @@ class EMS:
             if s["battery_soc"] > s["discharge_limit"]:
                 # Above discharge_limit: battery at max (4.6kW cap) for EV + house
                 self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+            elif s["solar_power"] > config.SOLAR_AVAILABLE_W:
+                # At or below discharge_limit but solar available: don't discharge —
+                # the solar production covers the house instead of the battery.
+                self._set_max_discharging(0)
+                self._ema_discharge = None
             else:
-                # At or below discharge_limit: battery covers house only
+                # At or below discharge_limit and no solar: battery covers house only
                 amps = self._compute_discharge_limit(s)
                 self._set_max_discharging(amps)
             # Wallbox is set to 32A on entry; user may adjust manually and it will stick.
