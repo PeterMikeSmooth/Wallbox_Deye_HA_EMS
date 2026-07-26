@@ -141,15 +141,12 @@ class EMS:
         self.state = State.EV_NO_SOLAR
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
 
-    def _enter_battery_priority(self, mode: str = "SOLAR_ONLY") -> None:
+    def _enter_battery_priority(self) -> None:
         log.info("→ BATTERY_PRIORITY")
         self.state = State.BATTERY_PRIORITY
         self._ema_discharge = None
-        # Boosted modes: never discharge battery even in BATTERY_PRIORITY
-        if mode == "SOLAR_BOOSTED":
-            self._set_max_discharging(0)
-        else:
-            self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        # Discharge policy (0A for SOLAR_BOOSTED, free otherwise) is applied
+        # every tick in the main loop, not just here — see tick().
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
 
     def _enter_solar_only(self) -> None:
@@ -483,7 +480,7 @@ class EMS:
         elif target == State.EV_NO_SOLAR:
             self._enter_ev_no_solar()
         elif target == State.BATTERY_PRIORITY:
-            self._enter_battery_priority(s.get("ems_mode", "SOLAR_ONLY").upper())
+            self._enter_battery_priority()
         elif target == State.SOLAR_ONLY:
             self._enter_solar_only()
         elif target == State.SOLAR_BOOSTED:
@@ -528,6 +525,15 @@ class EMS:
         if self.state == State.EV_NO_SOLAR:
             amps = self._compute_discharge_limit(s)
             self._set_max_discharging(amps)
+
+        elif self.state == State.BATTERY_PRIORITY:
+            # Re-evaluate every tick (not just on entry) so a mode change made
+            # while already parked in BATTERY_PRIORITY (e.g. SOLAR_BOOSTED ->
+            # SOLAR_ONLY without a state transition) takes effect immediately.
+            if s.get("ems_mode", "SOLAR_ONLY").upper() == "SOLAR_BOOSTED":
+                self._set_max_discharging(0)
+            else:
+                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
 
         elif self.state == State.FULL_SPEED:
             if s["battery_soc"] > s["discharge_limit"]:

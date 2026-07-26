@@ -205,7 +205,8 @@ The `100 W` solar threshold (`SOLAR_AVAILABLE_W`) naturally separates "day" from
 ### BATTERY_PRIORITY State (solar available, battery still charging)
 
 - **Trigger**: solar > 100 W AND `SOC < batt_charge_prio` (in a SOLAR mode)
-- **Entry actions**: `wallbox_current` → 6 A; `max_discharging_current` → 100 A (or **0 A** under `SOLAR_BOOSTED`, so the battery is never drained for the EV while it should be charging).
+- **Entry actions**: `wallbox_current` → 6 A.
+- **Fast loop (every tick, not just on entry)**: `max_discharging_current` → 100 A, or **0 A** under `SOLAR_BOOSTED` so the battery is never drained for the EV while it should be charging. Re-evaluating every tick (rather than only at state entry) ensures a mode switch made *while already parked in* `BATTERY_PRIORITY` (e.g. `SOLAR_BOOSTED → SOLAR_ONLY` with no state transition in between) takes effect immediately instead of leaving the battery stuck at the previous mode's discharge setting.
 - **Behavior**: the wallbox stays at the 6 A minimum so solar goes to the battery first. Once `SOC ≥ batt_charge_prio` → surplus state.
 
 ### SOLAR_ONLY State (solar surplus → EV, grid ≈ 0)

@@ -210,3 +210,6 @@ __marimo__/
 config.py
 logs/
 
+
+# Claude Code local settings (contains host/password — never commit)
+.claude/settings.local.json
