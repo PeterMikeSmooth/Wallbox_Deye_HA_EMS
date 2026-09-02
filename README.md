@@ -71,7 +71,6 @@ Two recurring missions run under every mode:
 
 | Entity | Description |
 |--------|-------------|
-| `input_text.ems_state` | Current internal state name |
 | `input_number.grid_ratio_value` | Share of EV power currently drawn from the grid (%) |
 | `input_number.range_needed_over_night` | Measured overnight battery drain (%), auto-computed |
 
@@ -406,7 +405,6 @@ nano config.py      # Fill in HA IP + token
 #   input_number.batt_charge_limit   (50–100 %, step 5, default 80)
 #   input_number.batt_charge_prio    (0–100 %)
 #   input_number.discharge_limit     (20–100 %)
-#   input_text.ems_state             (status display)
 #   input_number.grid_ratio_value    (status display, 0–100 %)
 #   input_number.range_needed_over_night (status display, 0–100 %)
 

@@ -51,6 +51,22 @@ log = _setup_logging()
 
 
 # ---------------------------------------------------------------------------
+# Discharge setpoint write policy
+#
+# Deliberately module constants and not config.py entries: the Pi's config.py
+# is gitignored and never updated by `git pull`, so a constant added here but
+# missing there would raise AttributeError inside the main loop's catch-all —
+# silently, tick after tick.
+# ---------------------------------------------------------------------------
+
+DISCHARGE_WRITE_DEADBAND_A = 2       # ignore corrections smaller than this
+DISCHARGE_WRITE_MIN_INTERVAL_S = 10  # min delay between small corrections
+DISCHARGE_LARGE_STEP_A = 5           # a step this big is written immediately
+DISCHARGE_RECONCILE_GRACE_S = 240    # let the inverter reflect a write before judging
+DISCHARGE_RECONCILE_SAMPLES = 2      # consecutive divergent reads before re-writing
+
+
+# ---------------------------------------------------------------------------
 # State enum
 # ---------------------------------------------------------------------------
 
@@ -102,11 +118,15 @@ class EMS:
         self.state = State.IDLE
         self._ema_discharge = None          # smoothed discharge current (A)
         self._last_written_discharge = None  # last integer written to HA
+        self._last_discharge_write_ts = 0.0  # monotonic ts of that write
+        self._discharge_divergence_n = 0     # consecutive divergent read-backs
+        self._discharge_alerted = False      # HA notification already raised
         self._last_written_wallbox = None
         self._last_written_charging = None
         self._last_slow_tick = 0.0          # timestamp of last slow-loop action
         self._storage_low_soc = False       # STORAGE_TO_EV: SOC below floor
-        self._car_connected = False         # wallbox: car plugged in
+        self._car_connected = None          # wallbox: car plugged in (None = unknown yet)
+        self._last_wallbox_status = None    # last logged wallbox status string
         self._last_written_grid_ratio = None
         self._battery_voltage = 52.0        # last known battery voltage
         # Wallbox override detection
@@ -127,7 +147,7 @@ class EMS:
         log.info("→ IDLE")
         self.state = State.IDLE
         self._ema_discharge = None
-        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
 
     def _enter_full_speed(self) -> None:
@@ -153,7 +173,7 @@ class EMS:
         log.info("→ SOLAR_ONLY")
         self.state = State.SOLAR_ONLY
         self._ema_discharge = None
-        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
         self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
 
@@ -161,7 +181,7 @@ class EMS:
         log.info("→ SOLAR_BOOSTED")
         self.state = State.SOLAR_BOOSTED
         self._ema_discharge = None
-        self._set_max_discharging(0)
+        self._set_max_discharging(0, force=True)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
         self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
 
@@ -179,7 +199,7 @@ class EMS:
         self.state = State.STORAGE_ONLY
         self._ema_discharge = None
         self._storage_low_soc = False
-        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
         self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
 
@@ -190,21 +210,88 @@ class EMS:
         self.state = State.MANUAL
         self._ema_discharge = None
         self._storage_low_soc = False
-        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+        self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
 
     # -- write-with-dedup helpers ---------------------------------------------
 
-    def _set_max_discharging(self, amps: int) -> None:
+    def _set_max_discharging(self, amps: int, force: bool = False) -> None:
+        """Write the Deye max discharge current, throttled.
+
+        *force* bypasses the deadband and rate limit: use it for policy values
+        (state entry, 0 A, free discharge) which must land immediately.  The
+        throttle exists because hammering this Modbus register roughly once per
+        second is what got a write silently dropped on 2026-08-27, leaving the
+        battery clamped at 5 A all night.
+        """
         # Global cap: apply MAX_DISCHARGE_POWER_W only when EV is charging
         # (long sustained discharge → inverter heating). Transient house loads are fine.
         if self.state != State.IDLE:
             max_from_power = int(config.MAX_DISCHARGE_POWER_W / max(self._battery_voltage, 1.0))
             amps = min(amps, max_from_power)
-        if self._last_written_discharge != amps:
-            self.ha.set_max_discharging_current(amps)
-            log.info("SET max_discharging_current = %d A", amps)
-            self._last_written_discharge = amps
+
+        if self._last_written_discharge == amps:
+            return
+
+        if not force and self._last_written_discharge is not None:
+            delta = abs(amps - self._last_written_discharge)
+            if delta < DISCHARGE_LARGE_STEP_A:
+                if delta < DISCHARGE_WRITE_DEADBAND_A:
+                    return
+                if time.monotonic() - self._last_discharge_write_ts < DISCHARGE_WRITE_MIN_INTERVAL_S:
+                    return
+
+        self._write_max_discharging(amps)
+
+    def _write_max_discharging(self, amps: int) -> None:
+        """Unconditional write + bookkeeping (also used by reconciliation)."""
+        self.ha.set_max_discharging_current(amps)
+        log.info("SET max_discharging_current = %d A", amps)
+        self._last_written_discharge = amps
+        self._last_discharge_write_ts = time.monotonic()
+        self._discharge_divergence_n = 0
+
+    def _reconcile_discharge(self, s: dict) -> None:
+        """Re-assert the discharge setpoint if the inverter dropped it.
+
+        HA acknowledges our write optimistically; the Deye integration only
+        reveals the truth at its next poll of the register.  Without this the
+        EMS stays convinced its setpoint is applied and never retries.
+        """
+        actual = s.get("max_discharging_actual")
+        want = self._last_written_discharge
+        if actual is None or want is None:
+            return
+        # Give the inverter/integration time to reflect the last write.
+        if time.monotonic() - self._last_discharge_write_ts < DISCHARGE_RECONCILE_GRACE_S:
+            return
+
+        if int(round(actual)) == want:
+            self._discharge_divergence_n = 0
+            self._discharge_alerted = False
+            return
+
+        self._discharge_divergence_n += 1
+        if self._discharge_divergence_n < DISCHARGE_RECONCILE_SAMPLES:
+            return
+
+        log.warning(
+            "Discharge setpoint diverged: inverter=%.0f A, expected %d A "
+            "(state=%s) — re-writing", actual, want, self.state.value,
+        )
+        if not self._discharge_alerted:
+            self._discharge_alerted = True
+            try:
+                self.ha.notify(
+                    "EMS: consigne de décharge non appliquée",
+                    f"L'onduleur est à {actual:.0f} A alors que l'EMS demande "
+                    f"{want} A (état {self.state.value}). Réécriture automatique.",
+                    "ems_discharge_divergence",
+                )
+            except Exception:
+                log.warning("Failed to raise HA notification", exc_info=True)
+
+        self._write_max_discharging(want)
 
     def _set_max_charging(self, amps: int) -> None:
         if self._last_written_charging != amps:
@@ -404,6 +491,24 @@ class EMS:
 
         self._solar_was_available = solar_available
 
+    # -- wallbox status -------------------------------------------------------
+
+    @staticmethod
+    def _car_plugged(status: str) -> bool | None:
+        """Is a car plugged in?  ``None`` when the status is not conclusive.
+
+        The wallbox reports many strings for a plugged car ("Charging",
+        "Connected: waiting for car demand", "Paused", "Discharging", ...), so
+        we classify by what means *unplugged* instead and treat missing /
+        unavailable states as unknown so the caller keeps its previous value.
+        """
+        st = status.strip().lower()
+        if not st or st in ("unavailable", "unknown", "none"):
+            return None
+        if any(k in st for k in ("ready", "unlocked", "disconnected", "no car")):
+            return False
+        return True
+
     # -- state evaluation -----------------------------------------------------
 
     def _determine_target_state(self, s: dict) -> State:
@@ -492,12 +597,6 @@ class EMS:
         elif target == State.MANUAL:
             self._enter_manual()
 
-        # Update HA with current state
-        try:
-            self.ha.set_ems_state(self.state.value)
-        except Exception:
-            log.warning("Failed to update ems_state in HA", exc_info=True)
-
     # -- per-tick logic -------------------------------------------------------
 
     def tick(self, s: dict) -> None:
@@ -507,15 +606,29 @@ class EMS:
         self._battery_voltage = s.get("battery_voltage", self._battery_voltage)
 
         # 0. Detect car plug-in → reset mode to default
-        car_connected = "connected" in s.get("wallbox_status", "").lower()
-        if car_connected and not self._car_connected:
-            log.info("Car plugged in — resetting ems_mode to %s", config.DEFAULT_EMS_MODE)
-            try:
-                self.ha.set_ems_mode(config.DEFAULT_EMS_MODE)
-                s["ems_mode"] = config.DEFAULT_EMS_MODE
-            except Exception:
-                log.warning("Failed to reset ems_mode", exc_info=True)
-        self._car_connected = car_connected
+        status = s.get("wallbox_status", "")
+        if status != self._last_wallbox_status:
+            log.info("Wallbox status: %r → %r", self._last_wallbox_status, status)
+            self._last_wallbox_status = status
+
+        plugged = self._car_plugged(status)
+        if plugged is not None:
+            # Rising edge only from a *known* unplugged state.  The wallbox
+            # status flips between "Charging" and "Connected: waiting for car
+            # demand" during a session (and can go unavailable); those must not
+            # look like a fresh plug-in and wipe the user's mode mid-charge.
+            # The ev_power guard is the belt-and-braces version of the same
+            # rule: whatever the status says, a car that is drawing power is
+            # not a car that was just plugged in.
+            charging = s["ev_power"] > config.EV_CHARGING_DETECT_W
+            if plugged and self._car_connected is False and not charging:
+                log.info("Car plugged in — resetting ems_mode to %s", config.DEFAULT_EMS_MODE)
+                try:
+                    self.ha.set_ems_mode(config.DEFAULT_EMS_MODE)
+                    s["ems_mode"] = config.DEFAULT_EMS_MODE
+                except Exception:
+                    log.warning("Failed to reset ems_mode", exc_info=True)
+            self._car_connected = plugged
 
         # 1. Evaluate state machine
         target = self._determine_target_state(s)
@@ -531,18 +644,18 @@ class EMS:
             # while already parked in BATTERY_PRIORITY (e.g. SOLAR_BOOSTED ->
             # SOLAR_ONLY without a state transition) takes effect immediately.
             if s.get("ems_mode", "SOLAR_ONLY").upper() == "SOLAR_BOOSTED":
-                self._set_max_discharging(0)
+                self._set_max_discharging(0, force=True)
             else:
-                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
 
         elif self.state == State.FULL_SPEED:
             if s["battery_soc"] > s["discharge_limit"]:
                 # Above discharge_limit: battery at max (4.6kW cap) for EV + house
-                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
             elif s["solar_power"] > config.SOLAR_AVAILABLE_W:
                 # At or below discharge_limit but solar available: don't discharge —
                 # the solar production covers the house instead of the battery.
-                self._set_max_discharging(0)
+                self._set_max_discharging(0, force=True)
                 self._ema_discharge = None
             else:
                 # At or below discharge_limit and no solar: battery covers house only
@@ -591,11 +704,11 @@ class EMS:
                 log.info("STORAGE_BOOSTED: SOC below %.0f%%, stopping",
                          soc_floor)
                 self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
-                self._set_max_discharging(0)
+                self._set_max_discharging(0, force=True)
                 self._ema_discharge = None
 
             if self._storage_low_soc:
-                self._set_max_discharging(0)
+                self._set_max_discharging(0, force=True)
             else:
                 off_peak = is_off_peak()
                 grid_ratio = config.BOOSTED_GRID_RATIO_OFF_PEAK if off_peak else config.BOOSTED_GRID_RATIO_PEAK
@@ -615,7 +728,7 @@ class EMS:
                 if soc >= soc_floor + 2:
                     self._storage_low_soc = False
                     log.info("STORAGE_ONLY: SOC recovered, resuming")
-                    self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+                    self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
                     self._ema_discharge = None
             elif soc < soc_floor:
                 self._storage_low_soc = True
@@ -632,7 +745,7 @@ class EMS:
                 # Direct calculation: wallbox = (max_discharge + solar - house) / voltage
                 # The Deye inverter keeps grid≈0 on its own, so the incremental
                 # algorithm cannot work (it always sees grid≈0 regardless of wallbox).
-                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
                 now = time.monotonic()
                 if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
                     self._last_slow_tick = now
@@ -677,7 +790,7 @@ class EMS:
                 self._last_written_discharge = None
 
             if not self._storage_low_soc:
-                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A)
+                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
 
         # 3. Update grid ratio indicator
         if s["ev_power"] > config.EV_CHARGING_DETECT_W:
@@ -703,6 +816,9 @@ class EMS:
         # 6. Dusk/sunrise tracking for overnight range
         self._track_overnight_range(s)
 
+        # 7. Verify the inverter actually kept our discharge setpoint
+        self._reconcile_discharge(s)
+
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -719,13 +835,14 @@ def main() -> None:
             sensors = ha.read_all_sensors()
             log.debug(
                 "sensors: ev=%.0fW solar=%.0fW soc=%.0f%% batt_pwr=%.0fW "
-                "grid=%.0fW batt_v=%.1fV grid_v=%.1fV limit=%.0f%% prio=%.0f%% mode=%s | state=%s",
+                "grid=%.0fW batt_v=%.1fV grid_v=%.1fV limit=%.0f%% prio=%.0f%% mode=%s "
+                "wallbox=%r | state=%s",
                 sensors["ev_power"], sensors["solar_power"],
                 sensors["battery_soc"], sensors["battery_power"],
                 sensors["grid_power"], sensors["battery_voltage"],
                 sensors["grid_voltage"], sensors["batt_charge_limit"],
                 sensors["batt_charge_prio"], sensors["ems_mode"],
-                ems.state.value,
+                sensors["wallbox_status"], ems.state.value,
             )
             ems.tick(sensors)
 

@@ -18,7 +18,6 @@ SENSOR_BATT_CHARGE_PRIO = "input_number.batt_charge_prio"
 SENSOR_DISCHARGE_LIMIT = "input_number.discharge_limit"
 SENSOR_EMS_MODE = "input_select.ems_mode"
 SENSOR_WALLBOX_STATUS = "sensor.wallbox_pulsar_max_sn_429953_status_description"
-INPUT_EMS_STATE = "input_text.ems_state"
 INPUT_GRID_RATIO = "input_number.grid_ratio_value"
 INPUT_RANGE_NEEDED = "input_number.range_needed_over_night"
 
@@ -72,6 +71,9 @@ class HomeAssistantAPI:
             "discharge_limit": self.get_state(SENSOR_DISCHARGE_LIMIT),
             "ems_mode": self.get_text_state(SENSOR_EMS_MODE),
             "wallbox_status": self.get_text_state(SENSOR_WALLBOX_STATUS),
+            # Read-back of our own setpoint: the inverter does not always keep
+            # what we write (see _reconcile_discharge in ems.py).
+            "max_discharging_actual": self.get_state(NUMBER_MAX_DISCHARGING_CURRENT),
         }
 
     # -- write helpers ---------------------------------------------------------
@@ -104,11 +106,12 @@ class HomeAssistantAPI:
         )
         resp.raise_for_status()
 
-    def set_ems_state(self, state: str) -> None:
-        """Write the current EMS state to HA input_text."""
+    def notify(self, title: str, message: str, notification_id: str) -> None:
+        """Raise a persistent notification in the HA UI."""
         resp = self._session.post(
-            f"{self._base}/api/services/input_text/set_value",
-            json={"entity_id": INPUT_EMS_STATE, "value": state},
+            f"{self._base}/api/services/persistent_notification/create",
+            json={"title": title, "message": message,
+                  "notification_id": notification_id},
             timeout=10,
         )
         resp.raise_for_status()
