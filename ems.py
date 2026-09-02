@@ -497,17 +497,28 @@ class EMS:
     def _car_plugged(status: str) -> bool | None:
         """Is a car plugged in?  ``None`` when the status is not conclusive.
 
-        The wallbox reports many strings for a plugged car ("Charging",
-        "Connected: waiting for car demand", "Paused", "Discharging", ...), so
-        we classify by what means *unplugged* instead and treat missing /
-        unavailable states as unknown so the caller keeps its previous value.
+        Keyword sets derived from the statuses this wallbox actually reports
+        (13 days of history): Charging, Locked/Locked-car-connected, Waiting,
+        Waiting for car demand, Ready, Disconnected, unavailable.  "Waiting" is
+        always a plugged context — it appears mid-session between two
+        "Charging" samples, which is exactly what used to fake a plug-in.
+
+        Plugged is checked first so "Locked, car connected" wins over the bare
+        "Locked".  A bare "Locked" is deliberately inconclusive: history shows
+        it mid-session ("Waiting for car demand" -> "Locked" -> "Locked, car
+        connected"), so it describes the charger's lock, not the plug.
+
+        Anything unrecognised returns None: the caller then keeps its previous
+        value rather than guessing, because a wrong True wipes the user's mode
+        mid-charge.
         """
         st = status.strip().lower()
-        if not st or st in ("unavailable", "unknown", "none"):
-            return None
-        if any(k in st for k in ("ready", "unlocked", "disconnected", "no car")):
+        if any(k in st for k in ("charging", "car connected", "connected:",
+                                 "waiting", "discharging", "paused", "queue")):
+            return True
+        if any(k in st for k in ("disconnected", "ready", "no car")):
             return False
-        return True
+        return None
 
     # -- state evaluation -----------------------------------------------------
 
