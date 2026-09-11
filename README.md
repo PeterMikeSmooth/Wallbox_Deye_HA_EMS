@@ -15,10 +15,11 @@ Python script running on a Raspberry Pi, managing EV charging and Deye battery v
 5. [Modes & States](#modes--states)
 6. [State Machine Routing](#state-machine-routing)
 7. [Detailed State Logic](#detailed-state-logic)
-8. [Algorithms](#algorithms)
-9. [Project Files](#project-files)
-10. [Configuration](#configuration)
-11. [Installation & Running](#installation--running)
+8. [Tesla Solar Pause](#tesla-solar-pause-solar_only-only)
+9. [Algorithms](#algorithms)
+10. [Project Files](#project-files)
+11. [Configuration](#configuration)
+12. [Installation & Running](#installation--running)
 
 ---
 
@@ -49,6 +50,17 @@ Two recurring missions run under every mode:
 | `grid_voltage` | `sensor.deye_load_l1_voltage` | House grid voltage | ~230 V |
 | `ev_power` | `sensor.shellyem_34945478aee1_channel_2_power` | EV charging power (Shelly meter) | 0 – 7500 W |
 | `wallbox_status` | `sensor.wallbox_pulsar_max_sn_429953_status_description` | Wallbox status text | — |
+| `tesla_location` | `device_tracker.martine_location` | Tesla location (Tessie) | `home` / `not_home` / … |
+| `tesla_charging` | `sensor.martine_charging` | Tesla charge state (Tessie) | `starting`, `charging`, `stopped`, `complete`, `disconnected`, `no_power` |
+| `tesla_charge_cable` | `binary_sensor.martine_charge_cable` | Cable plugged into the Tesla | `on` / `off` |
+| `tesla_charge_switch` | `switch.martine_charge` | Tesla charge allowed | `on` / `off` |
+
+> The four Tesla entities are **not** part of the 1 Hz sensor batch: they are read on demand
+> (`read_tesla_state`), only when the EMS is about to act — see
+> [no polling of the car](#vampire-drain-the-ems-never-polls-the-car). They are also read
+> **defensively** (`get_text_state_safe`): Tessie is a cloud integration, so a failure yields
+> `None` and the [Tesla solar pause](#tesla-solar-pause-solar_only-only) does nothing rather than
+> taking down the tick. They are used by that feature only.
 
 ### Actuators (write)
 
@@ -57,6 +69,7 @@ Two recurring missions run under every mode:
 | `number.deye_battery_max_charging_current` | Max battery charging current | 0 – 100 A |
 | `number.deye_battery_max_discharging_current` | Max battery discharging current | 0 – 100 A |
 | `number.wallbox_pulsar_max_sn_429953_maximum_charging_current` | Max wallbox charging current | 6 – 32 A |
+| `switch.martine_charge` | Tesla charge on/off (Tessie) — [`SOLAR_ONLY` only](#tesla-solar-pause-solar_only-only) | `on` / `off` |
 
 ### User Variables (to create in HA)
 
@@ -214,6 +227,7 @@ The `100 W` solar threshold (`SOLAR_AVAILABLE_W`) naturally separates "day" from
 - **Slow loop (60 s)**: [Surplus Steering Algorithm](#surplus-steering-algorithm) with `grid_target = 0`.
 - **Charging**: battery charge capped at `SURPLUS_MAX_CHARGING_A` to absorb transient solar spikes.
 - **Hysteresis**: drops to `BATTERY_PRIORITY` if `SOC < (batt_charge_prio − SOC_HYSTERESIS_PCT)`.
+- **Tesla solar pause**: when the sun can no longer sustain even the 6 A floor, the Tesla charge is stopped and restarted on its own — see [Tesla Solar Pause](#tesla-solar-pause-solar_only-only).
 
 ### SOLAR_BOOSTED State (solar surplus + grid share → EV)
 
@@ -240,6 +254,124 @@ The `100 W` solar threshold (`SOLAR_AVAILABLE_W`) naturally separates "day" from
 - **Wallbox**: started at 6 A on entry, then **never touched again** — the user sets the current from the app. On leaving MANUAL the wallbox is reset to 6 A.
 - **Battery**: discharges normally (100 A, `MAX_DISCHARGE_POWER_W` cap) while `SOC > discharge_limit`. Below the floor (hysteresis +2 %) the EMS **hands off** the Deye discharge current entirely so the user can set it manually in HA.
 - Wallbox override detection is disabled in MANUAL (a higher `ev_power` is intended, not a cloud override to fight).
+
+---
+
+## Tesla Solar Pause (`SOLAR_ONLY` only)
+
+In `SOLAR_ONLY` the wallbox can't go below **6 A** (≈ 1.4 kW). When the sun drops under that
+floor, the surplus steering has nothing left to give: the house battery — or the grid — silently
+makes up the difference, which is exactly what `SOLAR_ONLY` is supposed to avoid. This feature
+stops the car instead, and restarts it when the sun is back.
+
+It only acts on the **Tesla** (Tessie integration) and only in `SOLAR_ONLY` mode. Any other mode
+releases the pause immediately. Nothing here touches the wallbox setpoint.
+
+### Cutting the charge
+
+All of these must hold **continuously for `TESLA_PAUSE_CONFIRM_S` (5 min)** — a passing cloud
+never cuts the charge:
+
+| Condition | Why |
+|-----------|-----|
+| `ems_mode = SOLAR_ONLY` and the state is not `IDLE` | Feature is scoped to solar-surplus charging (`SOLAR_ONLY`, `EV_NO_SOLAR` and `BATTERY_PRIORITY` states are all covered) |
+| wallbox setpoint at its 6 A floor | The steering is already saturated — there is no smaller current to fall back to |
+| `max(battery_power, 0) + max(grid_power, 0) > TESLA_PAUSE_DEFICIT_W` (200 W) | The battery and/or the grid is covering what the sun doesn't |
+| `device_tracker.martine_location = home`, `binary_sensor.martine_charge_cable = on`, and `sensor.martine_charging` in `charging`/`starting` | **The car on the cable really is the Tesla** — the wallbox itself cannot tell which car is plugged in, and we must never stop someone else's charge |
+
+The first three come from the sensor batch the loop already reads. The last one — the only one
+that involves the Tesla — is checked **once, at the end of the 5 minutes**, right before acting.
+If it says another car (or Tessie is down), the countdown simply restarts, so the next look is
+another 5 minutes away.
+
+Action: `switch.martine_charge → off`. The EV power then drops and the EMS falls back to `IDLE`
+(wallbox back to 6 A) on its own. The `ems_mode` is left untouched.
+
+### Restarting the charge
+
+**No confirmation delay** — the charge restarts on the first tick where, the pause being active:
+
+| Condition | Value |
+|-----------|-------|
+| Surplus `= −(grid_power + battery_power)` ≥ `TESLA_RESUME_SURPLUS_W` | 1200 W going into the house battery and/or exported |
+| `device_tracker.martine_location` | `home` |
+| `binary_sensor.martine_charge_cable` | `on` |
+| `battery_soc ≥ batt_charge_prio` | The house battery has had its share first |
+
+The surplus and the SOC come from the Deye sensors the loop already reads; the Tesla entities are
+consulted **only once those two are satisfied**, to confirm the car is there before writing.
+
+Action: `switch.martine_charge → on`. The surplus steering then ramps the wallbox up from 6 A as
+usual. Because the cut needs 5 minutes and the restart needs a real 1.2 kW surplus, a cut/restart
+cycle can't happen more than about once every 5 minutes in borderline weather.
+
+### Releasing the pause
+
+The pause is **ours alone**: a charge the *user* stopped by hand is never restarted by the EMS.
+It is released as soon as:
+
+- `ems_mode` leaves `SOLAR_ONLY` → charge switched back on immediately;
+- the car leaves home or is unplugged → noticed at the 5-minutely check below. If Tessie then
+  refuses to start the charge (an unplugged car can't), the pause is dropped anyway and an HA
+  persistent notification warns that `switch.martine_charge` may have stayed off;
+- `switch.martine_charge` is found back **on** (you, or a Tessie schedule, re-enabled it) → the EMS
+  silently drops its pause, since it is no longer the one holding the charge off. Note the normal
+  cut logic can then arm again 5 minutes later: to charge on battery/grid, switch the EMS mode
+  instead of re-enabling the charge by hand.
+
+While the pause is active, unreadable Tesla entities (Tessie down) **hold** the pause rather than
+being read as "car gone".
+
+### Vampire drain: the EMS never polls the car
+
+The Tesla has a heavy vampire drain, so the loop is deliberately silent around it:
+
+| Situation | Tesla reads | Writes to the car |
+|-----------|-------------|-------------------|
+| Charging normally on solar, or no EV | **0** | 0 |
+| Deficit countdown running (≤ 5 min) | **0** until it elapses, then 1 | 0 |
+| Paused, waiting for the sun | **1 per 5 min** (with the heartbeat log) | 0 |
+| Cut / restart decision | 1 | 1 |
+
+Two things matter here and they are different:
+
+- **Reads never reach the car.** `GET /api/states/<entity>` is answered from Home Assistant's
+  in-memory state machine; no request goes out to Tessie, and nothing wakes the Tesla. Measured on
+  2026-09-11: 200 reads of the four entities in 2 s moved no `last_updated` at all. How often
+  Tessie itself polls the car is set by the integration, not by this EMS.
+- **Writes do reach the car**, and they are the only ones: exactly one `switch.martine_charge` per
+  cut and one per restart.
+
+The 5-minutely read while paused is what catches an unplug, a departure, or a manual re-enable —
+without it the EMS could sit on a stale pause with the car left unable to charge. Since these
+reads hit HA's cache, their cost is a few bytes on the LAN, not battery.
+
+### Persistence
+
+The flag lives in `logs/ems_state.json` (`{"tesla_paused": …, "tesla_paused_at": …}`) and is
+reloaded at startup, so restarting `ems.service` mid-pause doesn't leave the car switched off for
+the rest of the day.
+
+### Logs
+
+Everything is traced in `logs/ems.log` under the `TESLA PAUSE` / `TESLA RESUME` prefixes:
+deficit timer armed, timer cancelled, "not the Tesla charging" when another car is on the cable,
+cut (with the full power breakdown), a heartbeat every 5 minutes while paused (surplus vs. target,
+SOC vs. prio), and the restart with its reason.
+
+### Constants (in `ems.py`)
+
+| Constant | Default | Meaning |
+|----------|---------|---------|
+| `TESLA_PAUSE_CONFIRM_S` | 300 s | How long the deficit must hold before cutting |
+| `TESLA_PAUSE_DEFICIT_W` | 200 W | Battery discharge + grid import that counts as "not enough sun" |
+| `TESLA_RESUME_SURPLUS_W` | 1200 W | Surplus required to restart |
+| `TESLA_PAUSE_LOG_INTERVAL_S` | 300 s | Heartbeat log period while paused |
+| `TESLA_STATE_FILE` | `logs/ems_state.json` | Persisted pause flag |
+
+They are deliberately **module constants in `ems.py`**, not `config.py` entries: the Pi's
+`config.py` is gitignored and never refreshed by `git pull`, so a new key added here but missing
+there would raise `AttributeError` inside the main loop, tick after tick.
 
 ---
 
@@ -323,7 +455,8 @@ Wallbox_Deye_HA_EMS/
 ├── ha_api.py                 # Home Assistant API wrapper (read sensors, write actuators)
 ├── ems.py                    # EMS logic: state machine, algorithms, main loop
 └── logs/                     # Log directory (not committed)
-    └── ems.log               # Log of each wallbox/battery adjustment
+    ├── ems.log               # Log of each wallbox/battery adjustment
+    └── ems_state.json        # Persisted state (Tesla solar pause flag)
 ```
 
 ---

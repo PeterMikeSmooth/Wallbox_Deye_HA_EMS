@@ -21,6 +21,12 @@ SENSOR_WALLBOX_STATUS = "sensor.wallbox_pulsar_max_sn_429953_status_description"
 INPUT_GRID_RATIO = "input_number.grid_ratio_value"
 INPUT_RANGE_NEEDED = "input_number.range_needed_over_night"
 
+# Tesla (Tessie integration) — used by the SOLAR_ONLY solar-pause feature.
+TESLA_LOCATION = "device_tracker.martine_location"        # "home" when parked at home
+TESLA_CHARGING = "sensor.martine_charging"                # starting|charging|stopped|complete|disconnected|no_power
+TESLA_CHARGE_CABLE = "binary_sensor.martine_charge_cable"  # "on" = cable plugged in
+SWITCH_TESLA_CHARGE = "switch.martine_charge"             # on = car allowed to charge
+
 NUMBER_MAX_CHARGING_CURRENT = "number.deye_battery_max_charging_current"
 NUMBER_MAX_DISCHARGING_CURRENT = "number.deye_battery_max_discharging_current"
 NUMBER_WALLBOX_MAX_CURRENT = "number.wallbox_pulsar_max_sn_429953_maximum_charging_current"
@@ -56,6 +62,20 @@ class HomeAssistantAPI:
         resp.raise_for_status()
         return resp.json()["state"]
 
+    def get_text_state_safe(self, entity_id: str) -> str | None:
+        """Like :meth:`get_text_state` but never raises.
+
+        Used for the Tesla entities: they come from a cloud integration
+        (Tessie) that can disappear or return ``unavailable``.  A failure there
+        must not take down the whole tick — the caller treats ``None`` as
+        "unknown" and simply does nothing.
+        """
+        try:
+            return self.get_text_state(entity_id)
+        except Exception:
+            logger.warning("Could not read %s", entity_id, exc_info=True)
+            return None
+
     def read_all_sensors(self) -> dict:
         """Read every sensor needed in one batch and return a dict."""
         return {
@@ -74,6 +94,25 @@ class HomeAssistantAPI:
             # Read-back of our own setpoint: the inverter does not always keep
             # what we write (see _reconcile_discharge in ems.py).
             "max_discharging_actual": self.get_state(NUMBER_MAX_DISCHARGING_CURRENT),
+        }
+
+    def read_tesla_state(self) -> dict:
+        """Read the Tesla entities — deliberately NOT part of read_all_sensors.
+
+        These are Home Assistant state-machine reads: HA answers from its
+        in-memory cache, no request reaches Tessie and the car is never woken
+        (verified 2026-09-11: 200 reads in 2 s moved no ``last_updated``).  The
+        EMS still asks only when it is about to act, so the 1 Hz loop generates
+        no Tesla traffic at all in normal operation — see
+        ``_tesla_solar_pause`` in ems.py.
+
+        Every value may be None (cloud integration down).
+        """
+        return {
+            "tesla_location": self.get_text_state_safe(TESLA_LOCATION),
+            "tesla_charging": self.get_text_state_safe(TESLA_CHARGING),
+            "tesla_charge_cable": self.get_text_state_safe(TESLA_CHARGE_CABLE),
+            "tesla_charge_switch": self.get_text_state_safe(SWITCH_TESLA_CHARGE),
         }
 
     # -- write helpers ---------------------------------------------------------
@@ -134,6 +173,10 @@ class HomeAssistantAPI:
             timeout=10,
         )
         resp.raise_for_status()
+
+    def set_tesla_charge(self, on: bool) -> None:
+        """Start (True) or stop (False) the Tesla charge via Tessie."""
+        self.set_switch(SWITCH_TESLA_CHARGE, on)
 
     def set_select(self, entity_id: str, option: str) -> None:
         """Set a select entity option."""

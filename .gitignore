@@ -213,3 +213,6 @@ logs/
 
 # Claude Code local settings (contains host/password — never commit)
 .claude/settings.local.json
+
+# Memo de travail interne (contexte Claude) — jamais versionné
+MEMO_EMS_WALLBOX_DEYE.md

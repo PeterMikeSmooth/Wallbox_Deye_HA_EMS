@@ -11,6 +11,7 @@ See README.md for full specification.
 """
 
 import enum
+import json
 import logging
 import os
 import time
@@ -67,6 +68,22 @@ DISCHARGE_RECONCILE_SAMPLES = 2      # consecutive divergent reads before re-wri
 
 
 # ---------------------------------------------------------------------------
+# SOLAR_ONLY Tesla pause (see README "Tesla solar pause")
+#
+# Module constants for the same reason as the discharge ones above: the Pi's
+# config.py is gitignored and never refreshed by `git pull`.
+# ---------------------------------------------------------------------------
+
+TESLA_PAUSE_CONFIRM_S = 300     # deficit must hold this long before cutting
+TESLA_PAUSE_DEFICIT_W = 200     # battery discharge + grid import counting as "not enough sun"
+TESLA_RESUME_SURPLUS_W = 1200   # surplus (battery charge + grid export) that restarts the charge
+TESLA_PAUSE_LOG_INTERVAL_S = 300  # heartbeat log while the charge is paused
+TESLA_STATE_FILE = os.path.join(
+    os.path.dirname(config.LOG_FILE) or ".", "ems_state.json"
+)
+
+
+# ---------------------------------------------------------------------------
 # State enum
 # ---------------------------------------------------------------------------
 
@@ -88,6 +105,21 @@ class State(enum.Enum):
 
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
+
+
+def ha_text(s: dict, key: str) -> str | None:
+    """Normalized text reading, or ``None`` when the entity says nothing.
+
+    HA reports a missing/offline entity as the strings ``unknown`` /
+    ``unavailable``; callers must treat those exactly like a failed read, not
+    like a real value (see the Tesla entities, which come from a cloud
+    integration).
+    """
+    value = s.get(key)
+    if value is None:
+        return None
+    value = value.strip().lower()
+    return None if value in ("", "unknown", "unavailable", "none") else value
 
 
 def is_off_peak() -> bool:
@@ -136,6 +168,18 @@ class EMS:
         self._overnight_phase = "WAIT_FOR_NIGHT"  # WAIT_FOR_NIGHT | WAIT_FOR_DAYLIGHT
         self._soc_overnight_start = None          # SOC captured at dusk (last sub-threshold crossing)
         self._solar_was_available = True          # previous tick solar state (for edge detection)
+        # SOLAR_ONLY Tesla pause — the "paused" flag is persisted so a restart
+        # of ems.service never leaves the car switched off for the whole day.
+        self._tesla_deficit_since = None    # monotonic ts of the first deficit tick
+        self._tesla_pause_log_ts = 0.0      # last heartbeat log while paused
+        persisted = self._load_state_file()
+        self._tesla_paused = bool(persisted.get("tesla_paused", False))
+        self._tesla_paused_at = persisted.get("tesla_paused_at")
+        if self._tesla_paused:
+            log.info(
+                "TESLA PAUSE: restored from %s — charge was cut by the EMS at %s",
+                TESLA_STATE_FILE, self._tesla_paused_at,
+            )
         # Force safe wallbox default on startup
         self.ha.set_wallbox_current(config.WALLBOX_MIN_CURRENT_A)
         self._last_written_wallbox = config.WALLBOX_MIN_CURRENT_A
@@ -491,6 +535,258 @@ class EMS:
 
         self._solar_was_available = solar_available
 
+    # -- SOLAR_ONLY Tesla pause -----------------------------------------------
+
+    def _load_state_file(self) -> dict:
+        """Read the small persisted-state file (best effort)."""
+        try:
+            with open(TESLA_STATE_FILE) as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            log.warning("Could not read %s — starting clean", TESLA_STATE_FILE,
+                        exc_info=True)
+            return {}
+
+    def _save_state_file(self) -> None:
+        try:
+            with open(TESLA_STATE_FILE, "w") as fh:
+                json.dump({"tesla_paused": self._tesla_paused,
+                           "tesla_paused_at": self._tesla_paused_at}, fh)
+        except Exception:
+            log.warning("Could not persist %s", TESLA_STATE_FILE, exc_info=True)
+
+    def _clear_deficit_timer(self) -> None:
+        if self._tesla_deficit_since is not None:
+            log.info("TESLA PAUSE: deficit gone after %.0f s — cut cancelled",
+                     time.monotonic() - self._tesla_deficit_since)
+            self._tesla_deficit_since = None
+
+    def _read_tesla(self) -> dict:
+        """Normalized Tesla reading — only ever called when about to act.
+
+        These are Home Assistant *cache* reads: the state machine answers from
+        memory, nothing reaches Tessie and the car is never woken (verified
+        2026-09-11: 200 reads in 2 s moved no ``last_updated``).  The Tesla
+        still has a heavy vampire drain, so the loop stays deliberately silent
+        around it: on a quiet tick the EMS does not even ask HA about the car.
+        """
+        raw = self.ha.read_tesla_state()
+        return {
+            "location": ha_text(raw, "tesla_location"),
+            "cable": ha_text(raw, "tesla_charge_cable"),
+            "charging": ha_text(raw, "tesla_charging"),
+            "switch": ha_text(raw, "tesla_charge_switch"),
+        }
+
+    def _tesla_solar_pause(self, s: dict) -> None:
+        """SOLAR_ONLY only: stop the Tesla when the sun no longer covers it.
+
+        Cut — the wallbox is pinned at its 6 A floor *and* the house battery or
+        the grid is covering more than TESLA_PAUSE_DEFICIT_W, held continuously
+        for TESLA_PAUSE_CONFIRM_S (so a passing cloud never cuts the charge).
+        Only then do we look at the Tesla, to check the car on the cable really
+        is it: at home, plugged, and reporting charging/starting.  The wallbox
+        alone cannot tell which car is charging.
+
+        Resume — no delay: as soon as the surplus (battery charge + grid export)
+        reaches TESLA_RESUME_SURPLUS_W while the house battery has reached
+        batt_charge_prio, the car is checked and the charge restarts.
+
+        The pause is only ever *our* pause: a charge the user stopped by hand is
+        never restarted, and the flag survives a restart of ems.service through
+        TESLA_STATE_FILE.  Any other EMS mode releases it.
+
+        Tesla reads are on demand only (see :meth:`_read_tesla`): none at all on
+        a quiet tick, one every TESLA_PAUSE_CONFIRM_S at worst while a deficit
+        or a pause is running.
+        """
+        mode = (s.get("ems_mode") or "").upper()
+
+        if self._tesla_paused:
+            self._tesla_deficit_since = None
+            self._tesla_paused_tick(s, mode)
+            return
+
+        # Not paused.  Every gate below is read from the sensor batch we already
+        # have — the Tesla is not consulted unless the deficit actually elapses.
+        if mode != "SOLAR_ONLY" or self.state == State.IDLE:
+            self._clear_deficit_timer()
+            return
+
+        wallbox_floored = (
+            self._last_written_wallbox is not None
+            and self._last_written_wallbox <= config.WALLBOX_MIN_CURRENT_A
+        )
+        # What the sun is *not* covering: battery discharge and/or grid import.
+        deficit = max(s["battery_power"], 0.0) + max(s["grid_power"], 0.0)
+
+        if not (wallbox_floored and deficit > TESLA_PAUSE_DEFICIT_W):
+            self._clear_deficit_timer()
+            return
+
+        now = time.monotonic()
+        if self._tesla_deficit_since is None:
+            self._tesla_deficit_since = now
+            log.info(
+                "TESLA PAUSE: wallbox floored at %d A and deficit %.0f W "
+                "(batt=%.0fW grid=%.0fW solar=%.0fW) — checking the car in %d s "
+                "if it holds", self._last_written_wallbox, deficit,
+                s["battery_power"], s["grid_power"], s["solar_power"],
+                TESLA_PAUSE_CONFIRM_S,
+            )
+            return
+
+        if now - self._tesla_deficit_since < TESLA_PAUSE_CONFIRM_S:
+            return  # countdown running: no Tesla read, no write, nothing
+
+        # Countdown elapsed — the one moment we ask who is on the cable.
+        tesla = self._read_tesla()
+        is_tesla = (tesla["location"] == "home" and tesla["cable"] == "on"
+                    and tesla["charging"] in ("charging", "starting"))
+        if not is_tesla:
+            # Another car (or Tessie down): leave the charge alone and restart
+            # the countdown, so the next look is TESLA_PAUSE_CONFIRM_S away.
+            log.info(
+                "TESLA PAUSE: not the Tesla charging (location=%s cable=%s "
+                "charging=%s) — leaving the charge alone, next check in %d s",
+                tesla["location"], tesla["cable"], tesla["charging"],
+                TESLA_PAUSE_CONFIRM_S,
+            )
+            self._tesla_deficit_since = now
+            return
+
+        self._pause_tesla(s, deficit)
+
+    def _tesla_paused_tick(self, s: dict, mode: str) -> None:
+        """Per-tick work while *our* pause is active."""
+        if mode != "SOLAR_ONLY":
+            tesla = self._read_tesla()
+            self._resume_tesla(f"EMS mode is now {mode}",
+                               plugged=tesla["cable"] == "on")
+            return
+
+        # Surplus and SOC come from the sensor batch: while the sun is too weak
+        # the EMS does not talk to HA about the Tesla at all.
+        surplus = -(s["grid_power"] + s["battery_power"])
+        soc_ok = s["battery_soc"] >= s["batt_charge_prio"]
+        now = time.monotonic()
+
+        if soc_ok and surplus >= TESLA_RESUME_SURPLUS_W:
+            tesla = self._read_tesla()
+            if tesla["location"] is None or tesla["cable"] is None:
+                # Tessie unreachable: hold the pause rather than reading its
+                # silence as "car gone" and restarting under clouds.
+                self._tesla_pause_log_ts = now
+                log.warning("TESLA RESUME: Tesla state unreadable — holding the pause")
+                return
+            if tesla["location"] != "home" or tesla["cable"] != "on":
+                self._resume_tesla(
+                    f"car no longer plugged in at home "
+                    f"(location={tesla['location']}, cable={tesla['cable']})",
+                    plugged=tesla["cable"] == "on",
+                )
+                return
+            self._resume_tesla(
+                f"surplus {surplus:.0f} W >= {TESLA_RESUME_SURPLUS_W} W and "
+                f"SOC {s['battery_soc']:.0f}% >= prio {s['batt_charge_prio']:.0f}%",
+                plugged=True,
+            )
+            return
+
+        # Not enough sun yet.  Every TESLA_PAUSE_LOG_INTERVAL_S, say where we
+        # stand and take one look at the car — it may have been unplugged or
+        # driven away, or the user may have re-enabled the charge by hand.
+        if now - self._tesla_pause_log_ts >= TESLA_PAUSE_LOG_INTERVAL_S:
+            self._tesla_pause_log_ts = now
+            log.info(
+                "TESLA PAUSE: still paused — surplus=%.0fW (need %dW) "
+                "SOC=%.0f%% prio=%.0f%% solar=%.0fW",
+                surplus, TESLA_RESUME_SURPLUS_W, s["battery_soc"],
+                s["batt_charge_prio"], s["solar_power"],
+            )
+            self._check_pause_still_relevant()
+
+    def _check_pause_still_relevant(self) -> None:
+        """Five-minutely sanity check while paused (one HA cache read)."""
+        tesla = self._read_tesla()
+
+        if tesla["switch"] == "on":
+            # Somebody re-enabled the charge behind our back: the pause is no
+            # longer ours to hold.  The normal cut logic may arm again.
+            log.info("TESLA PAUSE: switch.martine_charge is back on — "
+                     "dropping the EMS pause")
+            self._tesla_paused = False
+            self._tesla_paused_at = None
+            self._save_state_file()
+            return
+
+        if tesla["location"] is None or tesla["cable"] is None:
+            log.warning("TESLA PAUSE: Tesla state unreadable — holding the pause")
+            return
+
+        if tesla["location"] != "home" or tesla["cable"] != "on":
+            self._resume_tesla(
+                f"car no longer plugged in at home "
+                f"(location={tesla['location']}, cable={tesla['cable']})",
+                plugged=tesla["cable"] == "on",
+            )
+
+    def _pause_tesla(self, s: dict, deficit: float) -> None:
+        log.warning(
+            "TESLA PAUSE: cutting the charge after %.0f s at wallbox %d A — "
+            "deficit=%.0fW (batt=%.0fW grid=%.0fW) solar=%.0fW ev=%.0fW SOC=%.0f%%",
+            time.monotonic() - self._tesla_deficit_since,
+            self._last_written_wallbox, deficit, s["battery_power"],
+            s["grid_power"], s["solar_power"], s["ev_power"], s["battery_soc"],
+        )
+        try:
+            self.ha.set_tesla_charge(False)
+        except Exception:
+            # Keep the timer armed: the next tick retries immediately.
+            log.warning("TESLA PAUSE: stop request failed — retrying next tick",
+                        exc_info=True)
+            return
+
+        self._tesla_paused = True
+        self._tesla_paused_at = datetime.now().isoformat(timespec="seconds")
+        self._tesla_deficit_since = None
+        self._tesla_pause_log_ts = time.monotonic()
+        self._save_state_file()
+        log.info(
+            "TESLA PAUSE: charge stopped (switch.martine_charge = off) — "
+            "waiting for %d W of surplus to restart", TESLA_RESUME_SURPLUS_W,
+        )
+
+    def _resume_tesla(self, reason: str, plugged: bool) -> None:
+        log.info("TESLA RESUME: restarting the charge — %s", reason)
+        try:
+            self.ha.set_tesla_charge(True)
+        except Exception:
+            log.warning("TESLA RESUME: start request failed", exc_info=True)
+            if plugged:
+                # Still on the cable: keep the pause and retry on the next tick.
+                return
+            # Unplugged car: Tessie cannot start a charge, so there is nothing
+            # left to resume.  Drop the pause but warn — switch.martine_charge
+            # may stay off until the user turns it back on.
+            try:
+                self.ha.notify(
+                    "EMS: charge Tesla restée coupée",
+                    "L'EMS avait coupé la charge (soleil insuffisant en "
+                    "SOLAR_ONLY) et n'a pas pu la relancer : la voiture n'est "
+                    "plus branchée. Vérifie switch.martine_charge avant le "
+                    "prochain branchement.",
+                    "ems_tesla_charge_off",
+                )
+            except Exception:
+                log.warning("Failed to raise HA notification", exc_info=True)
+
+        self._tesla_paused = False
+        self._tesla_paused_at = None
+        self._save_state_file()
+
     # -- wallbox status -------------------------------------------------------
 
     @staticmethod
@@ -802,6 +1098,9 @@ class EMS:
 
             if not self._storage_low_soc:
                 self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
+
+        # 2b. SOLAR_ONLY: cut / restart the Tesla charge with the sun
+        self._tesla_solar_pause(s)
 
         # 3. Update grid ratio indicator
         if s["ev_power"] > config.EV_CHARGING_DETECT_W:
