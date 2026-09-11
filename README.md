@@ -267,6 +267,27 @@ stops the car instead, and restarts it when the sun is back.
 It only acts on the **Tesla** (Tessie integration) and only in `SOLAR_ONLY` mode. Any other mode
 releases the pause immediately. Nothing here touches the wallbox setpoint.
 
+### The metric: sun available to the car
+
+Both decisions read **one** quantity, with a hysteresis band around it:
+
+```
+sun_to_ev = ev_power − battery_power − grid_power     (= solar_power − house_load)
+```
+
+This is the solar power actually reaching the car. The point is that **it reads the same whether
+the car is charging or stopped** — unlike a raw surplus.
+
+That is not a detail. Measured in production on 2026-09-11 at 17:40: the charge was cut, and
+20 seconds later the 1.18 kW the car had stopped drawing showed up as 1.23 kW of *surplus*, which
+crossed the restart threshold and started the charge again. A threshold on the surplus is crossed
+by the cut itself; a threshold on `sun_to_ev` is not.
+
+| Situation (same weather) | `sun_to_ev` | raw surplus `−(grid + battery)` |
+|---|---|---|
+| Car charging at 6 A | 899 W | −280 W |
+| Same instant, car stopped | 899 W | +899 W |
+
 ### Cutting the charge
 
 All of these must hold **continuously for `TESLA_PAUSE_CONFIRM_S` (5 min)** — a passing cloud
@@ -276,7 +297,7 @@ never cuts the charge:
 |-----------|-----|
 | `ems_mode = SOLAR_ONLY` and the state is not `IDLE` | Feature is scoped to solar-surplus charging (`SOLAR_ONLY`, `EV_NO_SOLAR` and `BATTERY_PRIORITY` states are all covered) |
 | wallbox setpoint at its 6 A floor | The steering is already saturated — there is no smaller current to fall back to |
-| `max(battery_power, 0) + max(grid_power, 0) > TESLA_PAUSE_DEFICIT_W` (200 W) | The battery and/or the grid is covering what the sun doesn't |
+| `sun_to_ev < TESLA_CUT_BELOW_W` (1000 W) | The sun no longer covers even the 6 A floor (~1.2 kW at this car), so the battery or the grid is making up the rest |
 | `device_tracker.martine_location = home`, `binary_sensor.martine_charge_cable = on`, and `sensor.martine_charging` in `charging`/`starting` | **The car on the cable really is the Tesla** — the wallbox itself cannot tell which car is plugged in, and we must never stop someone else's charge |
 
 The first three come from the sensor batch the loop already reads. The last one — the only one
@@ -293,13 +314,14 @@ Action: `switch.martine_charge → off`. The EV power then drops and the EMS fal
 
 | Condition | Value |
 |-----------|-------|
-| Surplus `= −(grid_power + battery_power)` ≥ `TESLA_RESUME_SURPLUS_W` | 1200 W going into the house battery and/or exported |
+| `sun_to_ev > TESLA_RESUME_ABOVE_W` | 1200 W — with the 1000 W cut floor this is a 200 W hysteresis band on the same quantity |
+| at least `TESLA_SETTLE_AFTER_CUT_S` since the cut | 120 s. The Shelly and the Deye do not sample at the same instant, so the readings right after a 1.2 kW load drop are not trustworthy — this is settling time, not policy |
 | `device_tracker.martine_location` | `home` |
 | `binary_sensor.martine_charge_cable` | `on` |
 | `battery_soc ≥ batt_charge_prio` | The house battery has had its share first |
 
-The surplus and the SOC come from the Deye sensors the loop already reads; the Tesla entities are
-consulted **only once those two are satisfied**, to confirm the car is there before writing.
+The sun and the SOC come from the Deye sensors the loop already reads; the Tesla entities are
+consulted **only once those are satisfied**, to confirm the car is there before writing.
 
 Action: `switch.martine_charge → on`. The surplus steering then ramps the wallbox up from 6 A as
 usual. Because the cut needs 5 minutes and the restart needs a real 1.2 kW surplus, a cut/restart
@@ -329,7 +351,7 @@ The Tesla has a heavy vampire drain, so the loop is deliberately silent around i
 | Situation | Tesla reads | Writes to the car |
 |-----------|-------------|-------------------|
 | Charging normally on solar, or no EV | **0** | 0 |
-| Deficit countdown running (≤ 5 min) | **0** until it elapses, then 1 | 0 |
+| Low-sun countdown running (≤ 5 min) | **0** until it elapses, then 1 | 0 |
 | Paused, waiting for the sun | **1 per 5 min** (with the heartbeat log) | 0 |
 | Cut / restart decision | 1 | 1 |
 
@@ -355,17 +377,18 @@ the rest of the day.
 ### Logs
 
 Everything is traced in `logs/ems.log` under the `TESLA PAUSE` / `TESLA RESUME` prefixes:
-deficit timer armed, timer cancelled, "not the Tesla charging" when another car is on the cable,
-cut (with the full power breakdown), a heartbeat every 5 minutes while paused (surplus vs. target,
-SOC vs. prio), and the restart with its reason.
+countdown armed, countdown cancelled, "not the Tesla charging" when another car is on the cable,
+cut (with the full power breakdown), a heartbeat every 5 minutes while paused (`sun_to_ev` vs.
+target, SOC vs. prio), and the restart with its reason.
 
 ### Constants (in `ems.py`)
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
-| `TESLA_PAUSE_CONFIRM_S` | 300 s | How long the deficit must hold before cutting |
-| `TESLA_PAUSE_DEFICIT_W` | 200 W | Battery discharge + grid import that counts as "not enough sun" |
-| `TESLA_RESUME_SURPLUS_W` | 1200 W | Surplus required to restart |
+| `TESLA_PAUSE_CONFIRM_S` | 300 s | How long the low sun must hold before cutting |
+| `TESLA_CUT_BELOW_W` | 1000 W | `sun_to_ev` under this = the sun no longer covers the charge |
+| `TESLA_RESUME_ABOVE_W` | 1200 W | `sun_to_ev` above this restarts it (200 W hysteresis) |
+| `TESLA_SETTLE_AFTER_CUT_S` | 120 s | Meter settling time before a restart can be judged |
 | `TESLA_PAUSE_LOG_INTERVAL_S` | 300 s | Heartbeat log period while paused |
 | `TESLA_STATE_FILE` | `logs/ems_state.json` | Persisted pause flag |
 

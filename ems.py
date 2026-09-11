@@ -74,9 +74,10 @@ DISCHARGE_RECONCILE_SAMPLES = 2      # consecutive divergent reads before re-wri
 # config.py is gitignored and never refreshed by `git pull`.
 # ---------------------------------------------------------------------------
 
-TESLA_PAUSE_CONFIRM_S = 300     # deficit must hold this long before cutting
-TESLA_PAUSE_DEFICIT_W = 200     # battery discharge + grid import counting as "not enough sun"
-TESLA_RESUME_SURPLUS_W = 1200   # surplus (battery charge + grid export) that restarts the charge
+TESLA_PAUSE_CONFIRM_S = 300     # low sun must hold this long before cutting
+TESLA_CUT_BELOW_W = 1000        # sun available to the car under this -> cut
+TESLA_RESUME_ABOVE_W = 1200     # ...and back above this -> restart (hysteresis band)
+TESLA_SETTLE_AFTER_CUT_S = 120  # let the meters settle before judging a restart
 TESLA_PAUSE_LOG_INTERVAL_S = 300  # heartbeat log while the charge is paused
 TESLA_STATE_FILE = os.path.join(
     os.path.dirname(config.LOG_FILE) or ".", "ems_state.json"
@@ -120,6 +121,20 @@ def ha_text(s: dict, key: str) -> str | None:
         return None
     value = value.strip().lower()
     return None if value in ("", "unknown", "unavailable", "none") else value
+
+
+def sun_to_ev(s: dict) -> float:
+    """Solar power actually available for the car, in W.
+
+    ``ev_power - battery_power - grid_power`` is algebraically the same as
+    ``solar_power - house_load``, and — unlike a raw surplus — it reads the same
+    whether the car is charging or stopped.  That is what makes a hysteresis
+    band possible at all: cutting a 1.2 kW charge instantly turns its
+    consumption into 1.2 kW of *surplus*, so a threshold expressed on the
+    surplus is crossed by the cut itself (observed in production on 2026-09-11
+    at 17:40: charge cut, then restarted 20 s later).
+    """
+    return s["ev_power"] - s["battery_power"] - s["grid_power"]
 
 
 def is_off_peak() -> bool:
@@ -170,7 +185,8 @@ class EMS:
         self._solar_was_available = True          # previous tick solar state (for edge detection)
         # SOLAR_ONLY Tesla pause — the "paused" flag is persisted so a restart
         # of ems.service never leaves the car switched off for the whole day.
-        self._tesla_deficit_since = None    # monotonic ts of the first deficit tick
+        self._tesla_low_sun_since = None    # monotonic ts of the first low-sun tick
+        self._tesla_cut_ts = 0.0            # monotonic ts of the last cut (settling)
         self._tesla_pause_log_ts = 0.0      # last heartbeat log while paused
         persisted = self._load_state_file()
         self._tesla_paused = bool(persisted.get("tesla_paused", False))
@@ -557,11 +573,11 @@ class EMS:
         except Exception:
             log.warning("Could not persist %s", TESLA_STATE_FILE, exc_info=True)
 
-    def _clear_deficit_timer(self) -> None:
-        if self._tesla_deficit_since is not None:
-            log.info("TESLA PAUSE: deficit gone after %.0f s — cut cancelled",
-                     time.monotonic() - self._tesla_deficit_since)
-            self._tesla_deficit_since = None
+    def _clear_low_sun_timer(self) -> None:
+        if self._tesla_low_sun_since is not None:
+            log.info("TESLA PAUSE: sun back after %.0f s — cut cancelled",
+                     time.monotonic() - self._tesla_low_sun_since)
+            self._tesla_low_sun_since = None
 
     def _read_tesla(self) -> dict:
         """Normalized Tesla reading — only ever called when about to act.
@@ -583,62 +599,66 @@ class EMS:
     def _tesla_solar_pause(self, s: dict) -> None:
         """SOLAR_ONLY only: stop the Tesla when the sun no longer covers it.
 
-        Cut — the wallbox is pinned at its 6 A floor *and* the house battery or
-        the grid is covering more than TESLA_PAUSE_DEFICIT_W, held continuously
-        for TESLA_PAUSE_CONFIRM_S (so a passing cloud never cuts the charge).
-        Only then do we look at the Tesla, to check the car on the cable really
-        is it: at home, plugged, and reporting charging/starting.  The wallbox
-        alone cannot tell which car is charging.
+        Both decisions read the same quantity, :func:`sun_to_ev` — the solar
+        power actually available for the car — with a hysteresis band:
+        cut under TESLA_CUT_BELOW_W, restart above TESLA_RESUME_ABOVE_W.
 
-        Resume — no delay: as soon as the surplus (battery charge + grid export)
-        reaches TESLA_RESUME_SURPLUS_W while the house battery has reached
-        batt_charge_prio, the car is checked and the charge restarts.
+        Cut — the wallbox is pinned at its 6 A floor *and* the sun gives the car
+        less than TESLA_CUT_BELOW_W, held continuously for TESLA_PAUSE_CONFIRM_S
+        (so a passing cloud never cuts the charge).  Only then do we look at the
+        Tesla, to check the car on the cable really is it: at home, plugged, and
+        reporting charging/starting.  The wallbox alone cannot tell which car is
+        charging.
+
+        Resume — no confirmation delay, only TESLA_SETTLE_AFTER_CUT_S of settling
+        after a cut (the Shelly and the Deye do not sample at the same instant,
+        and the readings right after a 1.2 kW load drop are not trustworthy).
 
         The pause is only ever *our* pause: a charge the user stopped by hand is
         never restarted, and the flag survives a restart of ems.service through
         TESLA_STATE_FILE.  Any other EMS mode releases it.
 
         Tesla reads are on demand only (see :meth:`_read_tesla`): none at all on
-        a quiet tick, one every TESLA_PAUSE_CONFIRM_S at worst while a deficit
+        a quiet tick, one every TESLA_PAUSE_CONFIRM_S at worst while a countdown
         or a pause is running.
         """
         mode = (s.get("ems_mode") or "").upper()
 
         if self._tesla_paused:
-            self._tesla_deficit_since = None
+            self._tesla_low_sun_since = None
             self._tesla_paused_tick(s, mode)
             return
 
         # Not paused.  Every gate below is read from the sensor batch we already
-        # have — the Tesla is not consulted unless the deficit actually elapses.
+        # have — the Tesla is not consulted unless the countdown actually runs out.
         if mode != "SOLAR_ONLY" or self.state == State.IDLE:
-            self._clear_deficit_timer()
+            self._clear_low_sun_timer()
             return
 
         wallbox_floored = (
             self._last_written_wallbox is not None
             and self._last_written_wallbox <= config.WALLBOX_MIN_CURRENT_A
         )
-        # What the sun is *not* covering: battery discharge and/or grid import.
-        deficit = max(s["battery_power"], 0.0) + max(s["grid_power"], 0.0)
+        available = sun_to_ev(s)
 
-        if not (wallbox_floored and deficit > TESLA_PAUSE_DEFICIT_W):
-            self._clear_deficit_timer()
+        if not (wallbox_floored and available < TESLA_CUT_BELOW_W):
+            self._clear_low_sun_timer()
             return
 
         now = time.monotonic()
-        if self._tesla_deficit_since is None:
-            self._tesla_deficit_since = now
+        if self._tesla_low_sun_since is None:
+            self._tesla_low_sun_since = now
             log.info(
-                "TESLA PAUSE: wallbox floored at %d A and deficit %.0f W "
-                "(batt=%.0fW grid=%.0fW solar=%.0fW) — checking the car in %d s "
-                "if it holds", self._last_written_wallbox, deficit,
-                s["battery_power"], s["grid_power"], s["solar_power"],
-                TESLA_PAUSE_CONFIRM_S,
+                "TESLA PAUSE: wallbox floored at %d A and only %.0f W of sun for "
+                "the car (< %d W; batt=%.0fW grid=%.0fW ev=%.0fW solar=%.0fW) — "
+                "checking the car in %d s if it holds",
+                self._last_written_wallbox, available, TESLA_CUT_BELOW_W,
+                s["battery_power"], s["grid_power"], s["ev_power"],
+                s["solar_power"], TESLA_PAUSE_CONFIRM_S,
             )
             return
 
-        if now - self._tesla_deficit_since < TESLA_PAUSE_CONFIRM_S:
+        if now - self._tesla_low_sun_since < TESLA_PAUSE_CONFIRM_S:
             return  # countdown running: no Tesla read, no write, nothing
 
         # Countdown elapsed — the one moment we ask who is on the cable.
@@ -654,10 +674,10 @@ class EMS:
                 tesla["location"], tesla["cable"], tesla["charging"],
                 TESLA_PAUSE_CONFIRM_S,
             )
-            self._tesla_deficit_since = now
+            self._tesla_low_sun_since = now
             return
 
-        self._pause_tesla(s, deficit)
+        self._pause_tesla(s, available)
 
     def _tesla_paused_tick(self, s: dict, mode: str) -> None:
         """Per-tick work while *our* pause is active."""
@@ -667,13 +687,14 @@ class EMS:
                                plugged=tesla["cable"] == "on")
             return
 
-        # Surplus and SOC come from the sensor batch: while the sun is too weak
-        # the EMS does not talk to HA about the Tesla at all.
-        surplus = -(s["grid_power"] + s["battery_power"])
+        # Sun and SOC come from the sensor batch: while the sun is too weak the
+        # EMS does not talk to HA about the Tesla at all.
+        available = sun_to_ev(s)
         soc_ok = s["battery_soc"] >= s["batt_charge_prio"]
         now = time.monotonic()
+        settled = now - self._tesla_cut_ts >= TESLA_SETTLE_AFTER_CUT_S
 
-        if soc_ok and surplus >= TESLA_RESUME_SURPLUS_W:
+        if settled and soc_ok and available > TESLA_RESUME_ABOVE_W:
             tesla = self._read_tesla()
             if tesla["location"] is None or tesla["cable"] is None:
                 # Tessie unreachable: hold the pause rather than reading its
@@ -689,8 +710,8 @@ class EMS:
                 )
                 return
             self._resume_tesla(
-                f"surplus {surplus:.0f} W >= {TESLA_RESUME_SURPLUS_W} W and "
-                f"SOC {s['battery_soc']:.0f}% >= prio {s['batt_charge_prio']:.0f}%",
+                f"{available:.0f} W of sun for the car > {TESLA_RESUME_ABOVE_W} W "
+                f"and SOC {s['battery_soc']:.0f}% >= prio {s['batt_charge_prio']:.0f}%",
                 plugged=True,
             )
             return
@@ -701,9 +722,9 @@ class EMS:
         if now - self._tesla_pause_log_ts >= TESLA_PAUSE_LOG_INTERVAL_S:
             self._tesla_pause_log_ts = now
             log.info(
-                "TESLA PAUSE: still paused — surplus=%.0fW (need %dW) "
+                "TESLA PAUSE: still paused — sun for the car=%.0fW (need >%dW) "
                 "SOC=%.0f%% prio=%.0f%% solar=%.0fW",
-                surplus, TESLA_RESUME_SURPLUS_W, s["battery_soc"],
+                available, TESLA_RESUME_ABOVE_W, s["battery_soc"],
                 s["batt_charge_prio"], s["solar_power"],
             )
             self._check_pause_still_relevant()
@@ -733,13 +754,15 @@ class EMS:
                 plugged=tesla["cable"] == "on",
             )
 
-    def _pause_tesla(self, s: dict, deficit: float) -> None:
+    def _pause_tesla(self, s: dict, available: float) -> None:
         log.warning(
             "TESLA PAUSE: cutting the charge after %.0f s at wallbox %d A — "
-            "deficit=%.0fW (batt=%.0fW grid=%.0fW) solar=%.0fW ev=%.0fW SOC=%.0f%%",
-            time.monotonic() - self._tesla_deficit_since,
-            self._last_written_wallbox, deficit, s["battery_power"],
-            s["grid_power"], s["solar_power"], s["ev_power"], s["battery_soc"],
+            "sun for the car=%.0fW (< %dW; batt=%.0fW grid=%.0fW) solar=%.0fW "
+            "ev=%.0fW SOC=%.0f%%",
+            time.monotonic() - self._tesla_low_sun_since,
+            self._last_written_wallbox, available, TESLA_CUT_BELOW_W,
+            s["battery_power"], s["grid_power"], s["solar_power"],
+            s["ev_power"], s["battery_soc"],
         )
         try:
             self.ha.set_tesla_charge(False)
@@ -751,12 +774,14 @@ class EMS:
 
         self._tesla_paused = True
         self._tesla_paused_at = datetime.now().isoformat(timespec="seconds")
-        self._tesla_deficit_since = None
-        self._tesla_pause_log_ts = time.monotonic()
+        self._tesla_low_sun_since = None
+        self._tesla_cut_ts = time.monotonic()
+        self._tesla_pause_log_ts = self._tesla_cut_ts
         self._save_state_file()
         log.info(
             "TESLA PAUSE: charge stopped (switch.martine_charge = off) — "
-            "waiting for %d W of surplus to restart", TESLA_RESUME_SURPLUS_W,
+            "waiting for more than %d W of sun for the car (meters settle for "
+            "%d s first)", TESLA_RESUME_ABOVE_W, TESLA_SETTLE_AFTER_CUT_S,
         )
 
     def _resume_tesla(self, reason: str, plugged: bool) -> None:
