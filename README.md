@@ -324,8 +324,14 @@ The sun and the SOC come from the Deye sensors the loop already reads; the Tesla
 consulted **only once those are satisfied**, to confirm the car is there before writing.
 
 Action: `switch.martine_charge → on`. The surplus steering then ramps the wallbox up from 6 A as
-usual. Because the cut needs 5 minutes and the restart needs a real 1.2 kW surplus, a cut/restart
-cycle can't happen more than about once every 5 minutes in borderline weather.
+usual. Because both thresholds sit on the same quantity, restarting cannot be triggered by the cut
+itself: within one weather condition the charge does not cycle at all, and borderline weather
+cannot cycle faster than the 5-minute countdown.
+
+A full house battery changes nothing here: this installation **exports** its surplus rather than
+curtailing it (measured over the 3 days to 2026-09-11: 11.7 % of grid samples below −100 W, peak
+−1792 W). Exported power is a negative `grid_power`, which `sun_to_ev` counts exactly like power
+sent to the battery, so the restart threshold is reachable at any SOC.
 
 ### Releasing the pause
 
