@@ -814,34 +814,85 @@ class EMS:
 
     # -- wallbox status -------------------------------------------------------
 
+    def _reset_mode_on_unplug(self, s: dict, status: str) -> None:
+        """Car unplugged: hand the next session back the default mode.
+
+        Fired on the falling edge of :meth:`_car_plugged`, which in practice
+        means "the wallbox just reported a bare Locked while a car was
+        plugged".  Doing this at unplug rather than at plug-in means the user
+        can plug in, pick FULL_SPEED and never see it wiped under them; it also
+        makes the detection latency free, since the mode is only consumed by
+        the *next* session.
+
+        ``ev_power`` can only veto, never confirm: power flowing proves a car
+        is there, but a car sitting idle draws the same ~6 W as an empty cable,
+        so silence proves nothing.  Over 9 days this veto blocked 0 of the 17
+        real unplug edges, so it costs nothing to keep.
+        """
+        if s["ev_power"] > config.EV_CHARGING_DETECT_W:
+            log.info(
+                "Car unplugged per wallbox (%r) but EV still draws %.0f W — "
+                "mode left untouched", status, s["ev_power"],
+            )
+            return
+        log.info("Car unplugged (wallbox: %r) — resetting ems_mode to %s",
+                 status, config.DEFAULT_EMS_MODE)
+        try:
+            self.ha.set_ems_mode(config.DEFAULT_EMS_MODE)
+            s["ems_mode"] = config.DEFAULT_EMS_MODE
+        except Exception:
+            log.warning("Failed to reset ems_mode", exc_info=True)
+
     @staticmethod
     def _car_plugged(status: str) -> bool | None:
         """Is a car plugged in?  ``None`` when the status is not conclusive.
 
-        Keyword sets derived from the statuses this wallbox actually reports
-        (13 days of history): Charging, Locked/Locked-car-connected, Waiting,
-        Waiting for car demand, Ready, Disconnected, unavailable.  "Waiting" is
-        always a plugged context — it appears mid-session between two
-        "Charging" samples, which is exactly what used to fake a plug-in.
+        Classification learned from 9 days of history by labelling every
+        ``status_description`` sample with ``sensor.wallbox_pulsar_max_charging_status``
+        (SMART_CONTROL_IN_PROGRESS / _CAPABLE = plugged, _NOT_AVAILABLE =
+        unplugged), measured as real interval overlap:
+
+            Locked                  0.1 h plugged / 109.3 h unplugged
+            Waiting for car demand 24.8 h plugged /   0.0 h unplugged
+            Locked, car connected  20.3 h plugged /   0.0 h unplugged
+            Waiting                19.6 h plugged /   0.0 h unplugged
+            Charging               17.9 h plugged /   0.0 h unplugged
+            Ready                   1.0 h plugged /   0.4 h unplugged  <- ambiguous
+            Disconnected            0.3 h plugged /   1.0 h unplugged  <- ambiguous
+
+        So a bare "Locked" is the *only* status that means "no car", and
+        "Ready"/"Disconnected"/"unavailable" are inconclusive: they must never
+        demote a plugged state.  "Ready" -> "Locked" happened 20 times in 10
+        days, every single time with the car already long gone — it is chatter
+        between two no-car statuses, not an unplug.
 
         Plugged is checked first so "Locked, car connected" wins over the bare
-        "Locked".  A bare "Locked" is deliberately inconclusive: history shows
-        it mid-session ("Waiting for car demand" -> "Locked" -> "Locked, car
-        connected"), so it describes the charger's lock, not the plug.
-
-        Anything unrecognised returns None: the caller then keeps its previous
-        value rather than guessing, because a wrong True wipes the user's mode
-        mid-charge.
+        "Locked", which is matched exactly rather than as a substring.
         """
         st = status.strip().lower()
         if any(k in st for k in ("charging", "car connected", "connected:",
                                  "waiting", "discharging", "paused", "queue")):
             return True
-        if any(k in st for k in ("disconnected", "ready", "no car")):
+        if st == "locked":
             return False
         return None
 
     # -- state evaluation -----------------------------------------------------
+
+    def _force_solar_only_on_low_soc(self, s: dict) -> State:
+        """SOC floor reached in a storage mode: fall back to SOLAR_ONLY.
+
+        This overrides a choice the user is actively making, so it targets
+        SOLAR_ONLY literally rather than ``DEFAULT_EMS_MODE``: it is a battery
+        protection, not a return to the default — unlike
+        :meth:`_reset_mode_on_unplug`, which ends a session.
+        """
+        self.ha.set_ems_mode("SOLAR_ONLY")
+        s["ems_mode"] = "SOLAR_ONLY"
+        log.info("SOC <= discharge_limit — forcing ems_mode to SOLAR_ONLY")
+        if s["solar_power"] > config.SOLAR_AVAILABLE_W:
+            return State.SOLAR_ONLY
+        return State.EV_NO_SOLAR
 
     def _determine_target_state(self, s: dict) -> State:
         """Determine the target state based on current sensor readings."""
@@ -858,21 +909,10 @@ class EMS:
         if mode == "MANUAL":
             return State.MANUAL
 
-        if mode == "STORAGE_BOOSTED":
+        if mode in ("STORAGE_BOOSTED", "STORAGE_ONLY"):
             if s["battery_soc"] <= s["discharge_limit"]:
-                self.ha.set_ems_mode("SOLAR_ONLY")
-                s["ems_mode"] = "SOLAR_ONLY"
-                log.info("SOC <= discharge_limit — forcing ems_mode to SOLAR_ONLY")
-                return State.SOLAR_ONLY if s["solar_power"] > config.SOLAR_AVAILABLE_W else State.EV_NO_SOLAR
-            return State.STORAGE_BOOSTED
-
-        if mode == "STORAGE_ONLY":
-            if s["battery_soc"] <= s["discharge_limit"]:
-                self.ha.set_ems_mode("SOLAR_ONLY")
-                s["ems_mode"] = "SOLAR_ONLY"
-                log.info("SOC <= discharge_limit — forcing ems_mode to SOLAR_ONLY")
-                return State.SOLAR_ONLY if s["solar_power"] > config.SOLAR_AVAILABLE_W else State.EV_NO_SOLAR
-            return State.STORAGE_ONLY
+                return self._force_solar_only_on_low_soc(s)
+            return State.STORAGE_BOOSTED if mode == "STORAGE_BOOSTED" else State.STORAGE_ONLY
 
         # SOLAR_ONLY / SOLAR_BOOSTED share routing
         solar_available = s["solar_power"] > config.SOLAR_AVAILABLE_W
@@ -937,7 +977,7 @@ class EMS:
         # Update battery voltage for global discharge cap
         self._battery_voltage = s.get("battery_voltage", self._battery_voltage)
 
-        # 0. Detect car plug-in → reset mode to default
+        # 0. Detect the end of a session → reset mode to default
         status = s.get("wallbox_status", "")
         if status != self._last_wallbox_status:
             log.info("Wallbox status: %r → %r", self._last_wallbox_status, status)
@@ -945,21 +985,15 @@ class EMS:
 
         plugged = self._car_plugged(status)
         if plugged is not None:
-            # Rising edge only from a *known* unplugged state.  The wallbox
-            # status flips between "Charging" and "Connected: waiting for car
-            # demand" during a session (and can go unavailable); those must not
-            # look like a fresh plug-in and wipe the user's mode mid-charge.
-            # The ev_power guard is the belt-and-braces version of the same
-            # rule: whatever the status says, a car that is drawing power is
-            # not a car that was just plugged in.
-            charging = s["ev_power"] > config.EV_CHARGING_DETECT_W
-            if plugged and self._car_connected is False and not charging:
-                log.info("Car plugged in — resetting ems_mode to %s", config.DEFAULT_EMS_MODE)
-                try:
-                    self.ha.set_ems_mode(config.DEFAULT_EMS_MODE)
-                    s["ems_mode"] = config.DEFAULT_EMS_MODE
-                except Exception:
-                    log.warning("Failed to reset ems_mode", exc_info=True)
+            # Edges are taken between *conclusive* states only.  An
+            # inconclusive status leaves _car_connected untouched, so the
+            # "Ready"/"Disconnected" chatter cannot fabricate an edge.
+            if plugged and self._car_connected is False:
+                # Plug-in: observation only.  The mode is deliberately left
+                # alone so the user can pick one while the car sits waiting.
+                log.info("Car plugged in (wallbox: %r) — mode left untouched", status)
+            elif not plugged and self._car_connected is True:
+                self._reset_mode_on_unplug(s, status)
             self._car_connected = plugged
 
         # 1. Evaluate state machine

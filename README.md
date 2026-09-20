@@ -123,9 +123,29 @@ All sensor reads and actuator writes go through the **Home Assistant REST API** 
 - **Fast loop (~1 s)**: read all sensors → detect car plug-in → evaluate the state machine → apply per-state continuous work (battery discharge limits, override detection, overnight tracking). Writes to HA **only when a value changes** to avoid hammering the Modbus bus.
 - **Slow loop (~60 s)**: wallbox current steering in the surplus/storage modes (`SOLAR_ONLY`, `SOLAR_BOOSTED`, `STORAGE_ONLY`, and the periodic 32 A refresh in `STORAGE_BOOSTED`). Implemented as a monotonic-clock gate inside the fast loop.
 
-### Car plug-in reset
+### Car unplug reset
 
-When the wallbox reports the car has just connected, `ems_mode` is reset to `DEFAULT_EMS_MODE` (`SOLAR_ONLY`) so a fresh session always starts from a safe, predictable mode.
+When the wallbox reports the car has just been **unplugged**, `ems_mode` is reset to `DEFAULT_EMS_MODE` (`SOLAR_ONLY`), so the next session starts from a safe, predictable mode. Plugging in only logs; it never touches the mode, so the user can plug in and pick a mode without it being overwritten underneath them.
+
+Doing it at unplug also makes the detection latency free: the mode is only consumed by the *next* session, so a reset that lands minutes late is still correct.
+
+**Detection.** The runtime signal is `sensor.wallbox_pulsar_max_sn_429953_status_description`, whose values were classified by labelling 9 days of history with `sensor.wallbox_pulsar_max_charging_status` (`SMART_CONTROL_IN_PROGRESS` / `_CAPABLE` = plugged, `_NOT_AVAILABLE` = unplugged — a 5-minute-polled sensor used for the study only, never read at runtime):
+
+| Status | Plugged | Unplugged | Verdict |
+|---|---:|---:|---|
+| `Locked` | 0.1 h | 109.3 h | **unplugged** |
+| `Waiting for car demand` | 24.8 h | 0.0 h | plugged |
+| `Locked, car connected` | 20.3 h | 0.0 h | plugged |
+| `Waiting` | 19.6 h | 0.0 h | plugged |
+| `Charging` | 17.9 h | 0.0 h | plugged |
+| `Ready` | 1.0 h | 0.4 h | ambiguous → inconclusive |
+| `Disconnected` | 0.3 h | 1.0 h | ambiguous → inconclusive |
+
+A bare `Locked` is therefore the **only** status that can demote a plugged state, and only when the last *conclusive* status was "plugged". `Ready`, `Disconnected`, `unavailable` and `Error` are transparent — they leave the remembered state alone, which is what neutralises the `Ready ↔ Locked` chatter (20 `Ready → Locked` transitions in 10 days, every one of them with the car long gone).
+
+Over 9 days this produced **zero false positives** (16/16 conclusive edges real) and caught 15 of 17 unplugs within 11 minutes.
+
+> **`ev_power` can only veto, never confirm.** A car sitting plugged and idle draws the same ~6 W standby as an empty cable, so no power does *not* mean no car. The guard in `_reset_mode_on_unplug()` blocks a reset when power is flowing (proof a car is there) and nothing else; it blocked 0 of the 17 real edges. Likewise `_determine_target_state()` returning `IDLE` below 40 W means "nothing to steer", not "unplugged".
 
 ---
 
@@ -533,7 +553,7 @@ MAX_DISCHARGE_POWER_W = 4600     # Never discharge more than 4.6 kW (EV charging
 
 WALLBOX_MIN_CURRENT_A = 6
 WALLBOX_MAX_CURRENT_A = 32
-DEFAULT_EMS_MODE = "SOLAR_ONLY"  # Mode reset when the car is plugged in
+DEFAULT_EMS_MODE = "SOLAR_ONLY"  # Mode restored when the car is unplugged
 
 # Logging
 LOG_FILE = "logs/ems.log"

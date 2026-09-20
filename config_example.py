@@ -39,7 +39,7 @@ MAX_DISCHARGE_POWER_W = 4600          # Never discharge more than 4.6 kW
 
 WALLBOX_MIN_CURRENT_A = 6
 WALLBOX_MAX_CURRENT_A = 32
-DEFAULT_EMS_MODE = "SOLAR_ONLY"   # Mode reset when car is plugged in
+DEFAULT_EMS_MODE = "SOLAR_ONLY"   # Mode restored when car is unplugged
 
 # Logging
 LOG_FILE = "logs/ems.log"
