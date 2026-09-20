@@ -153,10 +153,12 @@ Over 9 days this produced **zero false positives** (16/16 conclusive edges real)
 
 It is written on the same edges as the mode reset: `disconnected` on unplug, and on plug-in the identification runs:
 
-1. **Tesla** — `sensor.martine_charging` is one of `no_power` / `charging` / `starting` **and** `device_tracker.martine_location` is `home`. These are HA cache reads: no request reaches Tessie and the car is never woken.
+1. **Tesla** — `binary_sensor.martine_charge_cable` is `on` **and** `device_tracker.martine_location` is `home`. These are HA cache reads: no request reaches Tessie and the car is never woken. The cable is used rather than the charge state because over 9 days the Tesla was plugged in at home for 70.1 h and read `stopped` for 21.0 h of those — the EMS's own solar pause produces exactly that — so keying on the charge state would have missed the car one time in three. The cable never claimed the Tesla during an Ioniq session: the only disagreements totalled 0.2 h, in four 2-4 minute bursts where it was simply quicker than the wallbox's 5-minute-polled sensor.
 2. **Ioniq** — otherwise, `kia_uvo.force_update` asks the vehicle directly, then the answer is read once `sensor.moniq_location_last_updated` has advanced. `home` + `binary_sensor.moniq_ev_battery_plug` = `on` identifies it.
 3. **Otherwise** — `other connected`. If the Ioniq never answers, the result is `unknown`, which is not the same claim as "some other car".
 
+> The Hyundai API refuses a refresh while another is in flight (`DuplicateRequestError`), times out at 30 s often enough that the hourly HA automation logs it regularly, and occasionally 502s on the token exchange. So `force_update` failing is routine, not fatal: it is retried 3 times 30 s apart, and if the car still has not answered the thread keeps watching for up to 70 minutes and upgrades `unknown` once a fresh payload lands — usually via the hourly automation. Every write is pinned to the plug-in that started it, so a slow thread cannot overwrite a later session's verdict.
+>
 > The Bluelink cloud cache runs about 2 hours behind, so `kia_uvo.update` cannot answer "is it plugged in right now"; only `force_update` can. That call is synchronous and took 29 s when measured, so the whole sequence runs in a daemon thread with its own `HomeAssistantAPI` client — the 1 Hz loop keeps steering throughout.
 >
 > Freshness is judged on `sensor.moniq_location_last_updated`, not on `last_changed`: a binary sensor rewritten with the same value never moves its timestamps. The three `moniq_*` entities share one HA device, so that timestamp dates the plug reading too.

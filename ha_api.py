@@ -212,7 +212,7 @@ class HomeAssistantAPI:
         )
         resp.raise_for_status()
 
-    def force_update_ioniq(self) -> None:
+    def force_update_ioniq(self) -> bool:
         """Ask the Ioniq itself for fresh data (wakes the car).
 
         ``kia_uvo.update`` only re-reads the Bluelink cloud cache, which runs
@@ -220,13 +220,24 @@ class HomeAssistantAPI:
         is **synchronous and slow**: measured at 29 s on 2026-09-20, with the
         entities updated 32 s after the request and the payload 7 s old.  Never
         call this from the 1 Hz loop.
+
+        Returns False instead of raising, because failing is routine: the
+        Hyundai API answers ``DuplicateRequestError`` when a refresh is already
+        in flight (seen 2026-09-20 12:27) and times out at 30 s often enough
+        that the hourly HA automation logs it regularly.  A caller that treats
+        this as fatal reports "unknown" for a car that is simply busy.
         """
-        resp = self._session.post(
-            f"{self._base}/api/services/kia_uvo/force_update",
-            json={"device_id": IONIQ_DEVICE_ID},
-            timeout=90,
-        )
-        resp.raise_for_status()
+        try:
+            resp = self._session.post(
+                f"{self._base}/api/services/kia_uvo/force_update",
+                json={"device_id": IONIQ_DEVICE_ID},
+                timeout=90,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("kia_uvo.force_update failed: %s", exc)
+            return False
 
     def set_ev_connected(self, value: str) -> None:
         """Write which car is on the cable to the HA helper."""

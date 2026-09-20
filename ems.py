@@ -99,13 +99,13 @@ EV_OTHER = "other connected"
 EV_NONE = "disconnected"
 EV_UNKNOWN = "unknown"           # the Ioniq could not be reached — not "not the Ioniq"
 
-# A Tesla reporting one of these is on a cable; "stopped"/"complete" are not
-# listed because they say nothing about the plug.
-TESLA_PLUGGED_STATES = ("no_power", "charging", "starting")
-
-IONIQ_REFRESH_TIMEOUT_S = 45     # wait for the payload after force_update returns
+IONIQ_REFRESH_TIMEOUT_S = 60     # wait for the payload after force_update returns
 IONIQ_REFRESH_POLL_S = 3         # how often to look while waiting
 IONIQ_MAX_DATA_AGE_S = 120       # a payload older than this is not trusted
+IONIQ_FORCE_ATTEMPTS = 3         # DuplicateRequestError is transient — retry
+IONIQ_RETRY_DELAY_S = 30         # let the in-flight request finish first
+IONIQ_LATE_WATCH_S = 4200        # 70 min: long enough to catch the hourly
+IONIQ_LATE_POLL_S = 60           # HA automation that refreshes the car anyway
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +197,7 @@ class EMS:
         self._last_slow_tick = 0.0          # timestamp of last slow-loop action
         self._storage_low_soc = False       # STORAGE_TO_EV: SOC below floor
         self._car_connected = None          # wallbox: car plugged in (None = unknown yet)
+        self._ev_id_generation = 0          # bumped on every plug/unplug edge
         self._last_wallbox_status = None    # last logged wallbox status string
         self._last_written_grid_ratio = None
         self._battery_voltage = 52.0        # last known battery voltage
@@ -849,46 +850,85 @@ class EMS:
         touches the EMS state machine.
         """
         threading.Thread(target=self._identify_plugged_car_blocking,
+                         args=(self._ev_id_generation,),
                          name="ev-identify", daemon=True).start()
 
-    def _identify_plugged_car_blocking(self) -> None:
-        """Thread body: identify the car, then publish the answer."""
+    def _identify_plugged_car_blocking(self, generation: int) -> None:
+        """Thread body: identify the car, then publish the answer.
+
+        *generation* pins this run to the plug-in that started it, so a thread
+        still waiting on a slow Hyundai API cannot overwrite the verdict of a
+        later session.
+        """
         # Its own HA client: requests.Session is not thread-safe, and the main
         # loop keeps using self.ha throughout.
         ha = HomeAssistantAPI(config.HA_URL, config.HA_TOKEN)
         try:
-            label = self._detect_plugged_car(ha)
+            label = self._detect_plugged_car(ha, generation)
         except Exception:
             log.warning("EV identification failed", exc_info=True)
             label = EV_UNKNOWN
-        self._write_ev_connected(label, ha)
+        self._write_ev_connected(label, ha, generation)
+        if label == EV_UNKNOWN:
+            self._late_ioniq_watch(ha, generation)
 
-    def _detect_plugged_car(self, ha: HomeAssistantAPI) -> str:
+    def _detect_plugged_car(self, ha: HomeAssistantAPI, generation: int) -> str:
         """Which car is on the cable?  Tesla first, then Ioniq, else "other"."""
         # 1. Tesla — free: HA answers from its cache and the car is never woken.
+        #
+        # The cable sensor, not the charging state: over 9 days the Tesla was
+        # plugged in at home for 70.1 h, and for 21.0 h of those (30 %)
+        # sensor.martine_charging read "stopped" — which is what the EMS's own
+        # solar pause produces.  Keying on the charge state would have missed
+        # the car one time in three.  The cable never claimed "plugged at home"
+        # while another car was on the wallbox: the only disagreements were
+        # 0.2 h total, in four 2-4 min bursts where the cable was simply
+        # quicker than the wallbox's 5-minute-polled sensor.
         tesla = ha.read_tesla_state()
-        charging = ha_text(tesla, "tesla_charging")
+        cable = ha_text(tesla, "tesla_charge_cable")
         location = ha_text(tesla, "tesla_location")
-        if charging in TESLA_PLUGGED_STATES and location == "home":
+        if cable == "on" and location == "home":
             return EV_TESLA
-        log.info("EV id: not the Tesla (charging=%r location=%r)", charging, location)
+        log.info("EV id: not the Tesla (cable=%r location=%r)", cable, location)
 
         # 2. Ioniq — the Bluelink cache runs ~2 h behind, so ask the car itself.
-        before = ha_text(ha.read_ioniq_state(), "ioniq_data_ts")
-        ha.force_update_ioniq()
-        ioniq = self._wait_for_ioniq_refresh(ha, before)
+        ioniq = self._refresh_ioniq(ha, generation)
         if ioniq is None:
             # The car never answered.  That is "we do not know", not "some
             # other car" — saying EV_OTHER here would invent a third vehicle.
             return EV_UNKNOWN
+        return self._verdict_from_ioniq(ioniq)
+
+    @staticmethod
+    def _verdict_from_ioniq(ioniq: dict) -> str:
         loc = ha_text(ioniq, "ioniq_location")
         plug = ha_text(ioniq, "ioniq_plug")
         if loc == "home" and plug == "on":
             return EV_IONIQ
         log.info("EV id: not the Ioniq (location=%r plug=%r)", loc, plug)
-
-        # 3. Neither of ours.
         return EV_OTHER
+
+    def _refresh_ioniq(self, ha: HomeAssistantAPI, generation: int) -> dict | None:
+        """Get a fresh Bluelink payload, retrying a busy car.
+
+        ``force_update`` failing does not mean the car is unreachable: the
+        Hyundai API answers "Duplicate request" when a refresh is already in
+        flight, so we wait for that one to land before trying again.
+        """
+        for attempt in range(1, IONIQ_FORCE_ATTEMPTS + 1):
+            if generation != self._ev_id_generation:
+                log.info("EV id: superseded by a newer session, giving up")
+                return None
+            before = ha_text(ha.read_ioniq_state(), "ioniq_data_ts")
+            ok = ha.force_update_ioniq()
+            log.info("EV id: Ioniq force_update attempt %d/%d -> %s",
+                     attempt, IONIQ_FORCE_ATTEMPTS, "sent" if ok else "refused")
+            fresh = self._wait_for_ioniq_refresh(ha, before)
+            if fresh is not None:
+                return fresh
+            if attempt < IONIQ_FORCE_ATTEMPTS:
+                time.sleep(IONIQ_RETRY_DELAY_S)
+        return None
 
     def _wait_for_ioniq_refresh(self, ha: HomeAssistantAPI,
                                 before_ts: str | None) -> dict | None:
@@ -913,6 +953,37 @@ class EMS:
         log.warning("Ioniq did not refresh within %d s", IONIQ_REFRESH_TIMEOUT_S)
         return None
 
+    def _late_ioniq_watch(self, ha: HomeAssistantAPI, generation: int) -> None:
+        """Keep listening after giving up, and upgrade "unknown" if it clears.
+
+        An HA automation force-updates the Ioniq every hour while it draws
+        power, so a car we could not reach at plug-in time usually reports in
+        later — on 2026-09-20 the answer landed 33 min after the failed
+        attempt.  Waiting costs nothing here: the thread is already detached,
+        and it stops as soon as the cable state changes.
+        """
+        log.info("EV id: watching for a late Ioniq refresh (up to %d min)",
+                 IONIQ_LATE_WATCH_S // 60)
+        before = ha_text(ha.read_ioniq_state(), "ioniq_data_ts")
+        deadline = time.monotonic() + IONIQ_LATE_WATCH_S
+        while time.monotonic() < deadline:
+            time.sleep(IONIQ_LATE_POLL_S)
+            if generation != self._ev_id_generation:
+                log.info("EV id: late watch cancelled, cable state changed")
+                return
+            ioniq = ha.read_ioniq_state()
+            ts = ha_text(ioniq, "ioniq_data_ts")
+            if not ts or ts == before:
+                continue
+            age = self._payload_age_s(ts)
+            if age is None or age > IONIQ_LATE_WATCH_S:
+                continue
+            label = self._verdict_from_ioniq(ioniq)
+            log.info("EV id: late Ioniq answer (payload %.0f s old) -> %s", age, label)
+            self._write_ev_connected(label, ha, generation)
+            return
+        log.info("EV id: late watch expired, leaving %s", EV_UNKNOWN)
+
     @staticmethod
     def _payload_age_s(ts: str) -> float | None:
         """Age in seconds of an ISO timestamp, or None if it cannot be parsed.
@@ -925,8 +996,12 @@ class EMS:
             return None
         return (datetime.now(when.tzinfo) - when).total_seconds()
 
-    def _write_ev_connected(self, label: str, ha: HomeAssistantAPI | None = None) -> None:
+    def _write_ev_connected(self, label: str, ha: HomeAssistantAPI | None = None,
+                            generation: int | None = None) -> None:
         """Publish which car is on the cable to the HA helper."""
+        if generation is not None and generation != self._ev_id_generation:
+            log.info("EV id: dropping stale verdict %r", label)
+            return
         log.info("EV connected: %s", label)
         try:
             (ha or self.ha).set_ev_connected(label)
@@ -1108,6 +1183,8 @@ class EMS:
             # Edges are taken between *conclusive* states only.  An
             # inconclusive status leaves _car_connected untouched, so the
             # "Ready"/"Disconnected" chatter cannot fabricate an edge.
+            if plugged != self._car_connected and self._car_connected is not None:
+                self._ev_id_generation += 1
             if plugged and self._car_connected is False:
                 # Plug-in: observation only.  The mode is deliberately left
                 # alone so the user can pick one while the car sits waiting.
