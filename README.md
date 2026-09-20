@@ -147,6 +147,22 @@ Over 9 days this produced **zero false positives** (16/16 conclusive edges real)
 
 > **`ev_power` can only veto, never confirm.** A car sitting plugged and idle draws the same ~6 W standby as an empty cable, so no power does *not* mean no car. The guard in `_reset_mode_on_unplug()` blocks a reset when power is flowing (proof a car is there) and nothing else; it blocked 0 of the 17 real edges. Likewise `_determine_target_state()` returning `IDLE` below 40 W means "nothing to steer", not "unplugged".
 
+### Which car is on the cable
+
+`input_text.ev_connected` carries one of `Tesla connected`, `Ioniq connected`, `other connected`, `disconnected`, `unknown`. Two cars share this wallbox (a Tesla via Tessie and a Hyundai Ioniq via Kia Uvo / Bluelink), so "a car is plugged in" is not enough to know whose charge is being steered.
+
+It is written on the same edges as the mode reset: `disconnected` on unplug, and on plug-in the identification runs:
+
+1. **Tesla** — `sensor.martine_charging` is one of `no_power` / `charging` / `starting` **and** `device_tracker.martine_location` is `home`. These are HA cache reads: no request reaches Tessie and the car is never woken.
+2. **Ioniq** — otherwise, `kia_uvo.force_update` asks the vehicle directly, then the answer is read once `sensor.moniq_location_last_updated` has advanced. `home` + `binary_sensor.moniq_ev_battery_plug` = `on` identifies it.
+3. **Otherwise** — `other connected`. If the Ioniq never answers, the result is `unknown`, which is not the same claim as "some other car".
+
+> The Bluelink cloud cache runs about 2 hours behind, so `kia_uvo.update` cannot answer "is it plugged in right now"; only `force_update` can. That call is synchronous and took 29 s when measured, so the whole sequence runs in a daemon thread with its own `HomeAssistantAPI` client — the 1 Hz loop keeps steering throughout.
+>
+> Freshness is judged on `sensor.moniq_location_last_updated`, not on `last_changed`: a binary sensor rewritten with the same value never moves its timestamps. The three `moniq_*` entities share one HA device, so that timestamp dates the plug reading too.
+>
+> Beware of `ioniq_*`: a dead duplicate of the same vehicle, frozen on `unavailable` since 2026-09-11. The live entities are `moniq_*`.
+
 ---
 
 ## Modes & States

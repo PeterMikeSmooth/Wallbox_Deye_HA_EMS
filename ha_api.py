@@ -27,6 +27,17 @@ TESLA_CHARGING = "sensor.martine_charging"                # starting|charging|st
 TESLA_CHARGE_CABLE = "binary_sensor.martine_charge_cable"  # "on" = cable plugged in
 SWITCH_TESLA_CHARGE = "switch.martine_charge"             # on = car allowed to charge
 
+# Hyundai Ioniq (Kia Uvo / Bluelink integration, device "MONIQ") — used to
+# identify which car was just plugged in.  Beware: a second, dead set of
+# entities named ``ioniq_*`` still exists in HA, frozen since 2026-09-11; the
+# live ones are ``moniq_*``.
+IONIQ_LOCATION = "device_tracker.moniq_location"          # "home" when parked at home
+IONIQ_PLUG = "binary_sensor.moniq_ev_battery_plug"        # "on" = cable plugged in
+IONIQ_DATA_TS = "sensor.moniq_location_last_updated"      # ISO ts of the vehicle payload
+IONIQ_DEVICE_ID = "902392daab65cd8ce308c9571af29bad"      # kia_uvo services target a device
+
+INPUT_EV_CONNECTED = "input_text.ev_connected"
+
 NUMBER_MAX_CHARGING_CURRENT = "number.deye_battery_max_charging_current"
 NUMBER_MAX_DISCHARGING_CURRENT = "number.deye_battery_max_discharging_current"
 NUMBER_WALLBOX_MAX_CURRENT = "number.wallbox_pulsar_max_sn_429953_maximum_charging_current"
@@ -115,6 +126,20 @@ class HomeAssistantAPI:
             "tesla_charge_switch": self.get_text_state_safe(SWITCH_TESLA_CHARGE),
         }
 
+    def read_ioniq_state(self) -> dict:
+        """Read the Ioniq entities.  Every value may be None (integration down).
+
+        The three entities belong to the same HA device, so they are refreshed
+        by the same Bluelink payload: ``ioniq_data_ts`` therefore dates the
+        plug reading too, which is the only usable freshness signal — a
+        binary_sensor that keeps the same value never moves its ``last_updated``.
+        """
+        return {
+            "ioniq_location": self.get_text_state_safe(IONIQ_LOCATION),
+            "ioniq_plug": self.get_text_state_safe(IONIQ_PLUG),
+            "ioniq_data_ts": self.get_text_state_safe(IONIQ_DATA_TS),
+        }
+
     # -- write helpers ---------------------------------------------------------
 
     def set_number(self, entity_id: str, value: float) -> None:
@@ -186,3 +211,29 @@ class HomeAssistantAPI:
             timeout=10,
         )
         resp.raise_for_status()
+
+    def force_update_ioniq(self) -> None:
+        """Ask the Ioniq itself for fresh data (wakes the car).
+
+        ``kia_uvo.update`` only re-reads the Bluelink cloud cache, which runs
+        about 2 h behind; only ``force_update`` reaches the vehicle.  The call
+        is **synchronous and slow**: measured at 29 s on 2026-09-20, with the
+        entities updated 32 s after the request and the payload 7 s old.  Never
+        call this from the 1 Hz loop.
+        """
+        resp = self._session.post(
+            f"{self._base}/api/services/kia_uvo/force_update",
+            json={"device_id": IONIQ_DEVICE_ID},
+            timeout=90,
+        )
+        resp.raise_for_status()
+
+    def set_ev_connected(self, value: str) -> None:
+        """Write which car is on the cable to the HA helper."""
+        resp = self._session.post(
+            f"{self._base}/api/services/input_text/set_value",
+            json={"entity_id": INPUT_EV_CONNECTED, "value": value},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        logger.debug("SET %s = %s", INPUT_EV_CONNECTED, value)
