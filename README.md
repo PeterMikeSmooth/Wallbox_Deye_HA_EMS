@@ -138,12 +138,14 @@ Doing it at unplug also makes the detection latency free: the mode is only consu
 | `Locked, car connected` | 20.3 h | 0.0 h | plugged |
 | `Waiting` | 19.6 h | 0.0 h | plugged |
 | `Charging` | 17.9 h | 0.0 h | plugged |
-| `Ready` | 1.0 h | 0.4 h | ambiguous → inconclusive |
+| `Ready` | 1.0 h | 0.4 h | unplugged (see below) |
 | `Disconnected` | 0.3 h | 1.0 h | ambiguous → inconclusive |
 
-A bare `Locked` is therefore the **only** status that can demote a plugged state, and only when the last *conclusive* status was "plugged". `Ready`, `Disconnected`, `unavailable` and `Error` are transparent — they leave the remembered state alone, which is what neutralises the `Ready ↔ Locked` chatter (20 `Ready → Locked` transitions in 10 days, every one of them with the car long gone).
+`Locked` and `Ready` demote a plugged state; `Disconnected`, `unavailable` and `Error` are transparent, leaving the remembered state alone, because those are the shapes a cloud dropout takes. Either no-car status reached from an already-unplugged state produces no edge, which is what neutralises the `Locked ↔ Ready` chatter.
 
-Over 9 days this produced **zero false positives** (16/16 conclusive edges real) and caught 15 of 17 unplugs within 11 minutes.
+The time-weighted table makes `Ready` look ambiguous, but that is the 5-minute-polled label lagging rather than the status. Replayed as edges — how it is actually used — every `Ready` reached from a plugged state was a real unplug: four with the line at 7-8 W for the next hour, three where power returned only because another car was plugged in one to two minutes later. Trusting it finds 18 unplugs over the window instead of 17, two of them 6 and 7 minutes sooner, and loses none.
+
+No confirmation delay is applied. The dangerous case — a car mid-charge — always shows itself through `ev_power`, and that veto already guards the reset; across all 18 edges the line read 7 W or less and the veto never fired.
 
 > **`ev_power` can only veto, never confirm.** A car sitting plugged and idle draws the same ~6 W standby as an empty cable, so no power does *not* mean no car. The guard in `_reset_mode_on_unplug()` blocks a reset when power is flowing (proof a car is there) and nothing else; it blocked 0 of the 17 real edges. Likewise `_determine_target_state()` returning `IDLE` below 40 W means "nothing to steer", not "unplugged".
 

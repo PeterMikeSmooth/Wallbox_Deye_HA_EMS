@@ -1055,20 +1055,35 @@ class EMS:
             Ready                   1.0 h plugged /   0.4 h unplugged  <- ambiguous
             Disconnected            0.3 h plugged /   1.0 h unplugged  <- ambiguous
 
-        So a bare "Locked" is the *only* status that means "no car", and
-        "Ready"/"Disconnected"/"unavailable" are inconclusive: they must never
-        demote a plugged state.  "Ready" -> "Locked" happened 20 times in 10
-        days, every single time with the car already long gone — it is chatter
-        between two no-car statuses, not an unplug.
+        "Locked" and "Ready" both mean "no car"; "Disconnected" and
+        "unavailable" are inconclusive and must never demote a plugged state,
+        being the shapes a cloud dropout takes.
+
+        The time-weighted table above makes "Ready" look ambiguous, but that
+        is the 5-minute-polled label lagging, not the status.  Replayed as
+        *edges*, which is how it is actually used, every single "Ready"
+        reached from a plugged state was a real unplug (2026-09-22): four with
+        the line at 7-8 W for the next hour, three where power returned only
+        because another car was plugged in one to two minutes later.  Treating
+        it as conclusive finds 18 unplugs over the window instead of 17, two
+        of them 6 and 7 minutes sooner, and loses none.
+
+        No delay is needed before trusting it.  The dangerous case — a car
+        mid-charge — always shows itself through ev_power, and that veto lives
+        in :meth:`_reset_mode_on_unplug`.
+
+        "Ready" reached from an already-unplugged state is just chatter
+        between two no-car statuses: it produces no edge, because the
+        remembered state is already False.
 
         Plugged is checked first so "Locked, car connected" wins over the bare
-        "Locked", which is matched exactly rather than as a substring.
+        "Locked"; both no-car statuses are matched exactly, not as substrings.
         """
         st = status.strip().lower()
         if any(k in st for k in ("charging", "car connected", "connected:",
                                  "waiting", "discharging", "paused", "queue")):
             return True
-        if st == "locked":
+        if st in ("locked", "ready"):
             return False
         return None
 
