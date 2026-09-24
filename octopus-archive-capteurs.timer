@@ -1,0 +1,14 @@
+[Unit]
+Description=Republication horaire des capteurs Octopus
+
+[Timer]
+# Les etats pousses par REST ne survivent pas a un redemarrage de HA :
+# on les recree au plus tard une heure apres.
+OnCalendar=hourly
+OnBootSec=3min
+RandomizedDelaySec=2m
+Persistent=false
+Unit=octopus-archive-capteurs.service
+
+[Install]
+WantedBy=timers.target

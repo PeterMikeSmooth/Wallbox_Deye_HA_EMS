@@ -31,14 +31,32 @@
 #   En dessous de 40 W la puissance voiture est donc traitée comme nulle.
 #   Le seuil est celui de `config.EV_CHARGING_DETECT_W`, déjà utilisé par ems.py.
 #
-#   RENDEMENT BORNE : Octopus rembourse sur les kWh comptés par la **Wallbox**,
-#   pas par la pince Shelly. La pince mesure à l'entrée de la borne (électronique,
-#   veille, pertes internes comprises), la borne compte ce qu'elle délivre à la
-#   voiture. Mesuré sur 6 jours de relevés Octopus : la borne = 95,14 % de la
-#   pince. Le facteur vit dans `input_number.rendement_borne` pour être réajusté
-#   au fil des factures, sans toucher aux templates.
-#   Il s'applique au SEUL terme de remboursement : la base facturée du
-#   €/kWh reste l'énergie réellement tirée.
+#   DEUX FACTEURS s'appliquent au SEUL terme de remboursement (la base facturée
+#   du €/kWh reste l'énergie réellement tirée) :
+#
+#   1. `input_number.rendement_borne` = 0,9688 — PHYSIQUE. La pince mesure à
+#      l'entrée de la borne (électronique, veille, pertes internes comprises),
+#      la borne compte ce qu'elle délivre à la voiture. Mesuré sur 5 mois de
+#      relevés de l'appli Wallbox, écart-type 0,0019. Très stable.
+#
+#   2. `input_number.part_bonus_octopus` = **1,0 — NEUTRALISÉ le 24/09**.
+#      Ce facteur encaissait l'écart entre le bonus théorique (règle A) et
+#      celui réellement versé : 214,43 € dus contre 182,13 € versés sur
+#      mai-août, soit 84,94 %, donc 32,30 € manquants. Comme cet écart n'est
+#      **pas expliqué**, on refuse de le normaliser : les capteurs affichent
+#      désormais ce qu'Octopus DOIT, pas ce qu'il verse. À réactiver à 0,849
+#      seulement si Octopus fournit une raison valable — sinon c'est une
+#      créance, pas une correction. Le repli vaut 1,0 pour la même raison.
+#
+#   ATTENTION au sens du second, il a changé. On a d'abord cru qu'Octopus ne
+#   comptait que ~87 % des kWh : c'est FAUX. L'appariement session par session
+#   (API Kraken contre export Wallbox, recouvrement 24→31/08) montre qu'il en
+#   compte 98 %, avec 0,30 kWh seulement de sessions orphelines. Ce facteur
+#   n'est donc pas une perte de kWh mais un ÉCART DE TAUX, encore inexpliqué,
+#   qui varie de 79 % à 95 % selon le mois. À revalider à chaque facture.
+#
+#   Chaîne : kWh Shelly → ×0,9688 (pertes borne) → kWh comptés par Octopus
+#            → ×0,849 (écart de taux) → bonus réellement perçu.
 # ---------------------------------------------------------------------------
 
 template:
@@ -66,7 +84,7 @@ template:
           {% set remb = tarif - 0.08 %}
           {% set import_kw = ([grid_w, 0] | max) / 1000 %}
           {% set k = states('input_number.rendement_borne') | float(0.9686)
-                    * (states('input_number.part_bonus_octopus') | float(0.867)) %}
+                    * (states('input_number.part_bonus_octopus') | float(1.0)) %}
           {% set ev_kw = (ev_w / 1000 if ev_w > 40 else 0) * k %}
           {{ (import_kw * tarif - ev_kw * remb) | round(3) }}
         attributes:
@@ -136,7 +154,7 @@ template:
           {% set remb = tarif - 0.08 %}
           {% set import_kw = ([grid_w, 0] | max) / 1000 %}
           {% set k = states('input_number.rendement_borne') | float(0.9686)
-                    * (states('input_number.part_bonus_octopus') | float(0.867)) %}
+                    * (states('input_number.part_bonus_octopus') | float(1.0)) %}
           {% set ev_kw = (ev_w / 1000 if ev_w > 40 else 0) * k %}
           {% set base_kw = [import_kw, (ev_w / 1000 if ev_w > 40 else 0), 0.05] | max %}
           {{ ((import_kw * tarif - ev_kw * remb) / base_kw) | round(4) }}
@@ -207,7 +225,7 @@ template:
           {% set g_hc = states('sensor.grid_reseau_jour_hc') | float(0) * kg %}
           {% set g_hp = states('sensor.grid_reseau_jour_hp') | float(0) * kg %}
           {% set k = states('input_number.rendement_borne') | float(0.9686)
-                    * (states('input_number.part_bonus_octopus') | float(0.867)) %}
+                    * (states('input_number.part_bonus_octopus') | float(1.0)) %}
           {% set e_hc = states('sensor.evse_voiture_jour_hc') | float(0) * ke * k %}
           {% set e_hp = states('sensor.evse_voiture_jour_hp') | float(0) * ke * k %}
           {{ (abo
@@ -232,9 +250,132 @@ template:
           {% set g_hc = states('sensor.grid_reseau_mois_hc') | float(0) * kg %}
           {% set g_hp = states('sensor.grid_reseau_mois_hp') | float(0) * kg %}
           {% set k = states('input_number.rendement_borne') | float(0.9686)
-                    * (states('input_number.part_bonus_octopus') | float(0.867)) %}
+                    * (states('input_number.part_bonus_octopus') | float(1.0)) %}
           {% set e_hc = states('sensor.evse_voiture_mois_hc') | float(0) * ke * k %}
           {% set e_hp = states('sensor.evse_voiture_mois_hp') | float(0) * ke * k %}
           {{ (abo * now().day
               + g_hc * r_hc + g_hp * r_hp
               - e_hc * (r_hc - 0.08) - e_hp * (r_hp - 0.08)) | round(2) }}
+
+      # =====================================================================
+      # DÉCOMPOSITION DU MOIS — pour recouper avec les données d'Octopus
+      #
+      #   facture_hors_bonus_mois − remboursement_ev_mois = cout_energie_mois
+      #
+      # L'identité est EXACTE avec `remboursement_ev_mois`, qui est calculé
+      # depuis la pince Shelly comme `cout_energie_mois`. Elle ne l'est PAS
+      # avec `sensor.octopus_bonus_attendu`, qui vient de l'archive des
+      # sessions Octopus sur le Pi : les deux remboursements diffèrent d'une
+      # dizaine de pourcents, et cet écart EST l'inconnue « étage 2 »
+      # (compteur de la borne -> kWh retenus par Octopus). Le laisser visible
+      # est volontaire : c'est l'indicateur à surveiller.
+      # =====================================================================
+
+      - name: "Facture hors bonus mois"
+        unique_id: facture_hors_bonus_mois
+        unit_of_measurement: "€"
+        device_class: monetary
+        state_class: total
+        availability: >
+          {{ has_value('sensor.linky_25348914432154_off_peak_hours_rate')
+             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
+        state: >
+          {% set abo = state_attr('sensor.linky_25348914432154_latest_reading', 'cout_abonnement_euro') | float(0.628) %}
+          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
+          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set ug = state_attr('sensor.grid_reseau_mois_hc', 'unit_of_measurement') %}
+          {% set kg = 1000 if ug == 'MWh' else (0.001 if ug == 'Wh' else 1) %}
+          {% set g_hc = states('sensor.grid_reseau_mois_hc') | float(0) * kg %}
+          {% set g_hp = states('sensor.grid_reseau_mois_hp') | float(0) * kg %}
+          {{ (abo * now().day + g_hc * r_hc + g_hp * r_hp) | round(2) }}
+        attributes:
+          abonnement: >
+            {{ ((state_attr('sensor.linky_25348914432154_latest_reading', 'cout_abonnement_euro') | float(0.628))
+                * now().day) | round(2) }}
+          reseau: >
+            {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
+            {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+            {% set ug = state_attr('sensor.grid_reseau_mois_hc', 'unit_of_measurement') %}
+            {% set kg = 1000 if ug == 'MWh' else (0.001 if ug == 'Wh' else 1) %}
+            {{ ((states('sensor.grid_reseau_mois_hc') | float(0) * kg) * r_hc
+              + (states('sensor.grid_reseau_mois_hp') | float(0) * kg) * r_hp) | round(2) }}
+
+      - name: "Remboursement EV mois"
+        unique_id: remboursement_ev_mois
+        unit_of_measurement: "€"
+        device_class: monetary
+        state_class: total
+        availability: >
+          {{ has_value('sensor.linky_25348914432154_off_peak_hours_rate')
+             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
+        state: >
+          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
+          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
+          {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
+          {% set k = states('input_number.rendement_borne') | float(0.9688)
+                    * (states('input_number.part_bonus_octopus') | float(1.0)) %}
+          {% set e_hc = states('sensor.evse_voiture_mois_hc') | float(0) * ke * k %}
+          {% set e_hp = states('sensor.evse_voiture_mois_hp') | float(0) * ke * k %}
+          {{ (e_hc * (r_hc - 0.08) + e_hp * (r_hp - 0.08)) | round(2) }}
+        attributes:
+          ecart_vs_octopus: >
+            {% set o = states('sensor.octopus_bonus_attendu') | float(0) %}
+            {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
+            {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+            {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
+            {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
+            {% set k = states('input_number.rendement_borne') | float(0.9688)
+                      * (states('input_number.part_bonus_octopus') | float(1.0)) %}
+            {% set m = (states('sensor.evse_voiture_mois_hc') | float(0) * ke * k) * (r_hc - 0.08)
+                     + (states('sensor.evse_voiture_mois_hp') | float(0) * ke * k) * (r_hp - 0.08) %}
+            {{ (m - o) | round(2) if o > 0 else 'archive indisponible' }}
+
+      - name: "Shelly charge mois"
+        unique_id: shelly_charge_mois
+        unit_of_measurement: "kWh"
+        device_class: energy
+        state_class: total
+        availability: "{{ has_value('sensor.evse_voiture_mois_hc') }}"
+        state: >
+          {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
+          {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
+          {{ ((states('sensor.evse_voiture_mois_hc') | float(0)
+             + states('sensor.evse_voiture_mois_hp') | float(0)) * ke) | round(2) }}
+        attributes:
+          borne_estimee: >
+            {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
+            {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
+            {{ ((states('sensor.evse_voiture_mois_hc') | float(0)
+               + states('sensor.evse_voiture_mois_hp') | float(0)) * ke
+               * (states('input_number.rendement_borne') | float(0.9688))) | round(2) }}
+          etage2_vs_octopus: >
+            {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
+            {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
+            {% set borne = (states('sensor.evse_voiture_mois_hc') | float(0)
+                          + states('sensor.evse_voiture_mois_hp') | float(0)) * ke
+                          * (states('input_number.rendement_borne') | float(0.9688)) %}
+            {% set o = states('sensor.octopus_smartcharge_mois') | float(0) %}
+            {{ (o / borne) | round(4) if (borne > 0 and o > 0) else 'indisponible' }}
+
+      # -- Étage 2 : ce qu'Octopus retient, rapporté au compteur de la borne --
+      #    < 1 = Octopus compte moins que la borne n'a délivré.
+      #    Mesures contradictoires à ce jour : 0,905 (avril, totaux mensuels),
+      #    0,982 (24→31/08, appariement session par session), 0,891 (septembre).
+      #    À surveiller : c'est l'inconnue qui reste dans toute la chaîne.
+      #    NB : les attributs ne sont pas déployables via l'assistant Template
+      #    de l'UI (pas de champ `attributes`), d'où ce capteur dédié.
+      - name: "Etage2 Octopus sur borne"
+        unique_id: etage2_octopus_sur_borne
+        state_class: measurement
+        availability: >
+          {{ has_value('sensor.octopus_smartcharge_mois')
+             and has_value('sensor.evse_voiture_mois_hc') }}
+        state: >
+          {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
+          {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
+          {% set borne = (states('sensor.evse_voiture_mois_hc') | float(0)
+                        + states('sensor.evse_voiture_mois_hp') | float(0)) * ke
+                        * (states('input_number.rendement_borne') | float(0.9688)) %}
+          {% set o = states('sensor.octopus_smartcharge_mois') | float(0) %}
+          {{ (o / borne) | round(4) if (borne > 0 and o > 0) else 0 }}

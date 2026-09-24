@@ -12,6 +12,7 @@ Usage :
     python3 octopus_archive.py --import-wallbox f.csv   amorçage myWallbox
     python3 octopus_archive.py --import-octopus f.json  amorçage Octopus
     python3 octopus_archive.py --rapport 2026-09        détail d'un mois
+    python3 octopus_archive.py --capteurs               repousse les capteurs HA seuls
 """
 import os, sys, json, csv, csv as _csv, sqlite3, argparse, traceback
 import datetime as dt
@@ -281,6 +282,7 @@ def pousse_capteurs(c):
     mois = dt.date.today().strftime("%Y-%m")
     kwh, hc, hp, bonus, n = bilan(c, mois)
     taux = bonus / kwh if kwh else 0
+
     for eid, etat, unite, nom, attrs in (
         ("sensor.octopus_smartcharge_mois", round(kwh, 2), "kWh",
          "Octopus smartcharge du mois", {"sessions": n, "hc_kwh": round(hc, 2),
@@ -410,12 +412,19 @@ def main():
     ap.add_argument("--import-wallbox")
     ap.add_argument("--import-octopus")
     ap.add_argument("--rapport")
+    ap.add_argument("--capteurs", action="store_true",
+                    help="repousse seulement les 3 capteurs HA depuis la base locale "
+                         "(aucun appel à Kraken) — sert à les recréer après un "
+                         "redémarrage de HA, qui les efface")
     ap.add_argument("--sans-notif", action="store_true")
     a = ap.parse_args()
     c = base()
 
     if a.rapport:
         rapport(c, a.rapport)
+        return
+    if a.capteurs:
+        pousse_capteurs(c)
         return
     if a.import_wallbox:
         importe_wallbox(c, a.import_wallbox)

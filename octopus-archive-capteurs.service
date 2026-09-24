@@ -1,0 +1,12 @@
+[Unit]
+Description=Republie les capteurs Octopus dans Home Assistant
+Documentation=file:/home/raspAutel/projects/Wallbox_Deye_HA_EMS/octopus_archive.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=raspAutel
+WorkingDirectory=/home/raspAutel/projects/Wallbox_Deye_HA_EMS
+ExecStart=/usr/bin/python3 /home/raspAutel/projects/Wallbox_Deye_HA_EMS/octopus_archive.py --capteurs
+TimeoutStartSec=120
