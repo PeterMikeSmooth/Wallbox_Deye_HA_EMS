@@ -17,7 +17,7 @@ import os
 import time
 import sys
 import threading
-from datetime import datetime
+from datetime import date, datetime
 
 import config
 from ha_api import HomeAssistantAPI
@@ -83,6 +83,20 @@ TESLA_PAUSE_LOG_INTERVAL_S = 300  # heartbeat log while the charge is paused
 TESLA_STATE_FILE = os.path.join(
     os.path.dirname(config.LOG_FILE) or ".", "ems_state.json"
 )
+
+
+# ---------------------------------------------------------------------------
+# Deferred batt_charge_prio (see README "Overnight Range Tracking")
+#
+# Octopus refunds EV kWh at the current tariff, so solar sent to the car before
+# the midday off-peak window is worth more than solar stored in the battery.
+# At sunrise batt_charge_prio is only lowered to MORNING_BATT_CHARGE_PRIO; the
+# computed target is applied when the midday off-peak window opens.
+# Module constants, not config.py: same reason as the Tesla pause above.
+# ---------------------------------------------------------------------------
+
+MORNING_BATT_CHARGE_PRIO = 25       # % — batt_charge_prio from sunrise to release
+BATT_PRIO_RELEASE_AT = (12, 24)     # local (hour, minute): start of midday off-peak
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +234,16 @@ class EMS:
             log.info(
                 "TESLA PAUSE: restored from %s — charge was cut by the EMS at %s",
                 TESLA_STATE_FILE, self._tesla_paused_at,
+            )
+        # Deferred batt_charge_prio — persisted so a restart before the release
+        # time does not leave the prio at the morning value for the whole day.
+        self._pending_batt_prio = persisted.get("pending_batt_prio")
+        self._pending_batt_prio_date = persisted.get("pending_batt_prio_date")
+        if self._pending_batt_prio is not None:
+            log.info(
+                "BATT PRIO: restored from %s — target %.0f%% pending since %s",
+                TESLA_STATE_FILE, self._pending_batt_prio,
+                self._pending_batt_prio_date,
             )
         # Force safe wallbox default on startup
         self.ha.set_wallbox_current(config.WALLBOX_MIN_CURRENT_A)
@@ -561,20 +585,68 @@ class EMS:
             if solar_available:
                 range_needed = max(self._soc_overnight_start - soc, 0)
                 target = min(self._MIN_SOC_LFP + range_needed + self._SAFETY_MARGIN, 100)
+                morning = max(MORNING_BATT_CHARGE_PRIO, self._MIN_SOC_LFP)
+                defer = target > morning and not self._batt_prio_release_reached()
                 log.info(
                     "DAYLIGHT: SOC dusk=%.0f%% now=%.0f%% → range_needed=%.0f%% "
-                    "→ setting batt_charge_prio=%.0f%% discharge_limit=%.0f%%",
-                    self._soc_overnight_start, soc, range_needed, target, target,
+                    "→ setting batt_charge_prio=%.0f%%%s discharge_limit=%.0f%%",
+                    self._soc_overnight_start, soc, range_needed,
+                    morning if defer else target,
+                    " (target %.0f%% at %02d:%02d)" % ((target,) + BATT_PRIO_RELEASE_AT)
+                    if defer else "",
+                    target,
                 )
                 try:
                     self.ha.set_input_number("input_number.range_needed_over_night", range_needed)
-                    self.ha.set_input_number("input_number.batt_charge_prio", target)
                     self.ha.set_input_number("input_number.discharge_limit", target)
+                    self.ha.set_input_number("input_number.batt_charge_prio",
+                                             morning if defer else target)
+                    if defer:
+                        self._pending_batt_prio = target
+                        self._pending_batt_prio_date = date.today().isoformat()
+                        self._save_state_file()
                 except Exception:
                     log.warning("Failed to set overnight range helpers", exc_info=True)
                 self._overnight_phase = "WAIT_FOR_NIGHT"
 
         self._solar_was_available = solar_available
+
+    @staticmethod
+    def _batt_prio_release_reached() -> bool:
+        now = datetime.now()
+        return (now.hour, now.minute) >= BATT_PRIO_RELEASE_AT
+
+    def _release_batt_prio(self, s: dict) -> None:
+        """Apply the batt_charge_prio target deferred at sunrise.
+
+        Due at BATT_PRIO_RELEASE_AT, or at once if it dates from an earlier day
+        (service down across the release time).  A prio no longer at the
+        morning value was changed by the user in the meantime: left alone.
+        """
+        if self._pending_batt_prio is None:
+            return
+        stale = self._pending_batt_prio_date != date.today().isoformat()
+        if not (stale or self._batt_prio_release_reached()):
+            return
+        morning = max(MORNING_BATT_CHARGE_PRIO, self._MIN_SOC_LFP)
+        target = self._pending_batt_prio
+        if abs(s["batt_charge_prio"] - morning) >= 0.5:
+            log.info(
+                "BATT PRIO: release — prio is %.0f%% (changed by hand), "
+                "target %.0f%% dropped", s["batt_charge_prio"], target,
+            )
+        else:
+            try:
+                self.ha.set_input_number("input_number.batt_charge_prio", target)
+            except Exception:
+                log.warning("BATT PRIO: failed to set target %.0f%% — will retry",
+                            target, exc_info=True)
+                return
+            log.info("BATT PRIO: release — batt_charge_prio %.0f%% → %.0f%%",
+                     morning, target)
+        self._pending_batt_prio = None
+        self._pending_batt_prio_date = None
+        self._save_state_file()
 
     # -- SOLAR_ONLY Tesla pause -----------------------------------------------
 
@@ -594,7 +666,10 @@ class EMS:
         try:
             with open(TESLA_STATE_FILE, "w") as fh:
                 json.dump({"tesla_paused": self._tesla_paused,
-                           "tesla_paused_at": self._tesla_paused_at}, fh)
+                           "tesla_paused_at": self._tesla_paused_at,
+                           "pending_batt_prio": self._pending_batt_prio,
+                           "pending_batt_prio_date": self._pending_batt_prio_date},
+                          fh)
         except Exception:
             log.warning("Could not persist %s", TESLA_STATE_FILE, exc_info=True)
 
@@ -1397,6 +1472,7 @@ class EMS:
 
         # 6. Dusk/sunrise tracking for overnight range
         self._track_overnight_range(s)
+        self._release_batt_prio(s)
 
         # 7. Verify the inverter actually kept our discharge setpoint
         self._reconcile_discharge(s)

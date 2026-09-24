@@ -502,9 +502,16 @@ Two-phase state machine that measures how much the battery drains overnight and 
 - **WAIT_FOR_NIGHT** — on the falling edge of solar (dusk), capture `soc_dusk`. Later edges overwrite it, so the last crossing before 01:00 is the real sunset. At 01:00, lock it in.
 - **WAIT_FOR_DAYLIGHT** — on the first solar crossing above 100 W (sunrise), compute `range_needed = soc_dusk − soc_now`, then set:
   - `range_needed_over_night = range_needed`
-  - `batt_charge_prio = discharge_limit = min(MIN_SOC_LFP(20) + range_needed + SAFETY_MARGIN(10), 100)`
+  - `discharge_limit = target = min(MIN_SOC_LFP(20) + range_needed + SAFETY_MARGIN(10), 100)`
+  - `batt_charge_prio = MORNING_BATT_CHARGE_PRIO (25)`, then `target` at 12:24 (`BATT_PRIO_RELEASE_AT`)
 
 This keeps enough charge for the following night without over-charging.
+
+**Deferred `batt_charge_prio`.** Octopus refunds EV kWh at the current tariff (HP refund > HC refund), so in the morning the solar surplus goes to the car first: the prio stays low until the midday off-peak window (12:24–15:24), when the battery is recharged. Rules:
+- applied every day, whatever the mode (the prio only matters in the SOLAR modes);
+- if `target ≤ 25`, or sunrise happens after 12:24, `target` is written at once;
+- if the prio is no longer 25 at 12:24 (changed by hand), it is left alone;
+- the pending target is persisted in `logs/ems_state.json`: a restart after 12:24, or on a later day, applies it at once.
 
 ### Wallbox Override Protection
 
@@ -525,7 +532,7 @@ Wallbox_Deye_HA_EMS/
 ├── ems.py                    # EMS logic: state machine, algorithms, main loop
 └── logs/                     # Log directory (not committed)
     ├── ems.log               # Log of each wallbox/battery adjustment
-    └── ems_state.json        # Persisted state (Tesla solar pause flag)
+    └── ems_state.json        # Persisted state (Tesla solar pause flag, deferred batt_charge_prio)
 ```
 
 ---
