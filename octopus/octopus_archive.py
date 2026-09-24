@@ -18,15 +18,21 @@ import os, sys, json, csv, csv as _csv, sqlite3, argparse, traceback
 import datetime as dt
 import requests
 
-import config  # HA_URL, HA_TOKEN
+BASE = os.path.dirname(os.path.abspath(__file__))       # .../octopus
+RACINE = os.path.dirname(BASE)                          # racine du dépôt
+
+# config.py (HA_URL, HA_TOKEN) vit à la racine, ce script dans octopus/
+sys.path.insert(0, RACINE)
+import config  # noqa: E402
 
 KRAKEN = "https://api.oefr-kraken.energy/v1/graphql/"
 COMPTE = os.environ.get("OCTOPUS_ACCOUNT", "A-5EE1FD14")
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(BASE, "octopus_archive.sqlite")
-CSV_OUT = os.path.join(BASE, "octopus_archive.csv")
-JSONL_OUT = os.path.join(BASE, "octopus_archive.jsonl")
+DATA = os.path.join(BASE, "data")
+os.makedirs(DATA, exist_ok=True)
+DB = os.path.join(DATA, "octopus_archive.sqlite")
+CSV_OUT = os.path.join(DATA, "octopus_archive.csv")
+JSONL_OUT = os.path.join(DATA, "octopus_archive.jsonl")
 
 EV_ENERGIE = "sensor.shellyem_34945478aee1_channel_2_energy"
 NOTIFY = "mobile_app_iphone2"

@@ -217,10 +217,5 @@ logs/
 # Memo de travail interne (contexte Claude) — jamais versionné
 MEMO_EMS_WALLBOX_DEYE.md
 
-# Sorties Octopus (données perso)
-octopus_schema.json
-octopus_data_*.json
-octopus_dispatches.json
-octopus_scan.json
-octopus_sessions.json
-octopus_sessions.csv
+# Sorties Octopus : journal de sessions = journal de présence, jamais sur GitHub
+octopus/data/
