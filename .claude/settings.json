@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh raspAutel@192.168.8.192:*)",
+      "Bash(scp:*)"
+    ]
+  }
+}
