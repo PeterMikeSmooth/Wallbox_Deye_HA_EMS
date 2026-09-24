@@ -1,0 +1,14 @@
+[Unit]
+Description=Archive des sessions de recharge Octopus (API Kraken -> SQLite)
+Documentation=file:/home/raspAutel/projects/Wallbox_Deye_HA_EMS/octopus_archive.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=raspAutel
+WorkingDirectory=/home/raspAutel/projects/Wallbox_Deye_HA_EMS
+EnvironmentFile=/home/raspAutel/.octopus_env
+ExecStart=/usr/bin/python3 /home/raspAutel/projects/Wallbox_Deye_HA_EMS/octopus_archive.py
+# Le relevé n'est jamais critique : on réessaie le lendemain plutôt que de boucler.
+TimeoutStartSec=600

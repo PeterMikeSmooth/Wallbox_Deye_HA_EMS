@@ -1,0 +1,13 @@
+[Unit]
+Description=Releve quotidien de l'archive Octopus
+
+[Timer]
+OnCalendar=*-*-* 05:00:00
+# Etale la charge si plusieurs machines tapent l'API au meme moment
+RandomizedDelaySec=15m
+# Rattrape le releve si le Pi etait eteint a l'heure prevue
+Persistent=true
+Unit=octopus-archive.service
+
+[Install]
+WantedBy=timers.target

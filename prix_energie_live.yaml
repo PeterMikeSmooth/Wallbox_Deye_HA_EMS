@@ -1,0 +1,240 @@
+# ---------------------------------------------------------------------------
+# Prix de l'énergie en temps réel — Linky HC/HP + remboursement Octopus EV
+#
+# À coller dans configuration.yaml. Si une clé `template:` existe déjà, ne
+# recopier que le bloc `- sensor:` à la suite de celles qui s'y trouvent.
+# Puis : Outils de développement > YAML > « Recharger les entités template ».
+#
+# Conventions de calcul :
+#   - channel_1 est signé : + = import réseau, − = export solaire.
+#     L'export est valorisé 0 € (pas de rachat), donc la part réseau est
+#     bornée à zéro et ne peut jamais créer un faux gain.
+#   - Le remboursement Octopus est calculé en `tarif − 0.08`, pas en dur :
+#     0.1656 − 0.08 = 0.0856 €/kWh en HC, 0.216 − 0.08 = 0.136 €/kWh en HP.
+#     Si Linky change ses tarifs, le remboursement suit tout seul.
+#   - Le remboursement porte sur les kWh entrés dans la voiture, quelle que
+#     soit leur origine (réseau ou solaire) : il est donc soustrait
+#     intégralement, indépendamment de la part réseau.
+#
+# Rappel d'unités, parce que c'est le piège de tout ce calcul :
+#     kW × €/kWh = €/h      (un débit de dépense)
+#     €/h ÷ kW   = €/kWh    (un prix)
+#   Voiture à 2,6 kW sur du solaire en HC : le débit est −0,22 €/h, et le
+#   prix du kWh est −0,0856 €/kWh. Multiplier 2,6 par 0,0856 ne donne pas un
+#   prix, ça donne le débit.
+#
+#   Les deux capteurs ne lisent que les 2 pinces Shelly + les 3 entités Linky.
+#
+#   SEUIL VOITURE : la Wallbox tire ~7 W de veille en permanence, même borne
+#   verrouillée et sans voiture. Ces watts sont bien consommés, mais aucun kWh
+#   n'entre dans la voiture, donc ils n'ouvrent aucun droit au remboursement.
+#   En dessous de 40 W la puissance voiture est donc traitée comme nulle.
+#   Le seuil est celui de `config.EV_CHARGING_DETECT_W`, déjà utilisé par ems.py.
+#
+#   RENDEMENT BORNE : Octopus rembourse sur les kWh comptés par la **Wallbox**,
+#   pas par la pince Shelly. La pince mesure à l'entrée de la borne (électronique,
+#   veille, pertes internes comprises), la borne compte ce qu'elle délivre à la
+#   voiture. Mesuré sur 6 jours de relevés Octopus : la borne = 95,14 % de la
+#   pince. Le facteur vit dans `input_number.rendement_borne` pour être réajusté
+#   au fil des factures, sans toucher aux templates.
+#   Il s'applique au SEUL terme de remboursement : la base facturée du
+#   €/kWh reste l'énergie réellement tirée.
+# ---------------------------------------------------------------------------
+
+template:
+  - sensor:
+
+      # -- 1. Débit de dépense instantané, en €/h ---------------------------
+      #    (kW réseau importés × tarif) − (kW voiture × remboursement)
+      #    Aucune division : ce capteur est valide en toutes circonstances,
+      #    y compris réseau à zéro pile. C'est celui à mettre en gros.
+      - name: "Coût énergie live"
+        unique_id: cout_energie_live
+        unit_of_measurement: "€/h"
+        state_class: measurement
+        availability: >
+          {{ has_value('sensor.shellyem_34945478aee1_channel_1_power')
+             and has_value('sensor.shellyem_34945478aee1_channel_2_power')
+             and has_value('sensor.linky_25348914432154_off_peak_hours_rate')
+             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
+        state: >
+          {% set grid_w = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
+          {% set ev_w   = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
+          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set remb = tarif - 0.08 %}
+          {% set import_kw = ([grid_w, 0] | max) / 1000 %}
+          {% set k = states('input_number.rendement_borne') | float(0.9686)
+                    * (states('input_number.part_bonus_octopus') | float(0.867)) %}
+          {% set ev_kw = (ev_w / 1000 if ev_w > 40 else 0) * k %}
+          {{ (import_kw * tarif - ev_kw * remb) | round(3) }}
+        attributes:
+          heures_creuses: >
+            {{ is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') }}
+          tarif_en_cours: >
+            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+            {{ (states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) | round(4) }}
+          remboursement_ev: >
+            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+            {{ ((states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                 else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) - 0.08) | round(4) }}
+          cout_reseau_h: >
+            {% set grid_w = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
+            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+            {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                           else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+            {{ ((([grid_w, 0] | max) / 1000) * tarif) | round(3) }}
+          gain_ev_h: >
+            {% set ev_w = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
+            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+            {% set remb = (states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                           else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) - 0.08 %}
+            {{ (0 - (ev_w / 1000 if ev_w > 40 else 0) * remb) | round(3) }}
+          puissance_reseau_w: >
+            {{ states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) | round(0) }}
+          puissance_ev_w: >
+            {{ states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) | round(0) }}
+
+      # -- 2. Prix moyen du kWh facturé, en €/kWh --------------------------
+      #    = coût horaire ÷ base facturée.
+      #
+      #    Base facturée = max(import réseau, puissance voiture, 50 W).
+      #    On ne moyenne QUE les kWh qui ont un prix : ceux achetés au réseau
+      #    et ceux qui déclenchent le remboursement Octopus. Le solaire que
+      #    boit la maison est gratuit et n'entre pas dans la moyenne — c'est
+      #    la différence avec un dénominateur « conso totale », qui diluerait
+      #    le prix vers zéro (maison 1 kW réseau + 1 kW solaire : 0.216 €/kWh
+      #    ici, contre 0.108 avec la conso totale).
+      #
+      #    Le `max` entre réseau et voiture est ce qui rend le calcul possible
+      #    sans mesurer la maison : quand le solaire couvre tout, l'import
+      #    tombe à zéro mais la voiture, elle, tire toujours ses kW, donc le
+      #    dénominateur ne s'écrase jamais. Le plancher à 50 W couvre le seul
+      #    cas restant — ni import ni voiture — où le coût vaut 0 de toute
+      #    façon. Aucune dépendance au Deye ni à l'Envoy : ce capteur ne lit
+      #    que les deux pinces Shelly et les tarifs Linky.
+      #
+      #    Bornes : entre −remboursement (voiture au solaire) et +tarif
+      #    (réseau seul, pas de voiture).
+      - name: "Prix kWh effectif"
+        unique_id: prix_kwh_effectif
+        unit_of_measurement: "€/kWh"
+        state_class: measurement
+        availability: >
+          {{ has_value('sensor.shellyem_34945478aee1_channel_1_power')
+             and has_value('sensor.shellyem_34945478aee1_channel_2_power')
+             and has_value('sensor.linky_25348914432154_off_peak_hours_rate')
+             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
+        state: >
+          {% set grid_w = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
+          {% set ev_w   = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
+          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set remb = tarif - 0.08 %}
+          {% set import_kw = ([grid_w, 0] | max) / 1000 %}
+          {% set k = states('input_number.rendement_borne') | float(0.9686)
+                    * (states('input_number.part_bonus_octopus') | float(0.867)) %}
+          {% set ev_kw = (ev_w / 1000 if ev_w > 40 else 0) * k %}
+          {% set base_kw = [import_kw, (ev_w / 1000 if ev_w > 40 else 0), 0.05] | max %}
+          {{ ((import_kw * tarif - ev_kw * remb) / base_kw) | round(4) }}
+        attributes:
+          base_facturee_w: >
+            {% set grid_w = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
+            {% set ev_w = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
+            {{ ([([grid_w, 0] | max), (ev_w if ev_w > 40 else 0), 50] | max) | round(0) }}
+          tarif_en_cours: >
+            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+            {{ (states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) | round(4) }}
+          remboursement_ev: >
+            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+            {{ ((states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                 else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) - 0.08) | round(4) }}
+          part_reseau_pct: >
+            {% set grid_w = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
+            {% set ev_w = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
+            {% set base = [([grid_w, 0] | max), (ev_w if ev_w > 40 else 0), 50] | max %}
+            {{ (100 * ([grid_w, 0] | max) / base) | round(0) }}
+
+      # =====================================================================
+      # COÛTS CUMULÉS — jour et mois calendaire
+      #
+      # Structure : abonnement + kWh réseau valorisés au tarif de la plage
+      # horaire où ils ont été consommés − remboursement Octopus sur les kWh
+      # entrés dans la voiture, lui aussi ventilé HC/HP.
+      #
+      # La ventilation HC/HP vient de 4 utility_meter à tarifs, dont le tarif
+      # est basculé par l'automatisation « Tarif HC/HP — bascule des compteurs
+      # d'énergie » sur le binary_sensor du Linky :
+      #   sensor.grid_reseau_jour_hc  / _hp   (source: channel_1_energy)
+      #   sensor.grid_reseau_mois_hc  / _hp
+      #   sensor.evse_voiture_jour_hc / _hp   (source: channel_2_energy)
+      #   sensor.evse_voiture_mois_hc / _hp
+      #
+      # L'abonnement journalier est lu dans les attributs du dernier relevé
+      # Linky (`cout_abonnement_euro`, 0.628 €/j) — c'est le chiffre
+      # qu'Octopus applique. Repli sur 0.628 si l'attribut manque.
+      #
+      # PIÈGE D'UNITÉ : un utility_meter hérite l'unité de sa source.
+      # channel_1_energy est en **MWh**, channel_2_energy en **kWh** — les
+      # compteurs réseau sont donc en MWh et les compteurs voiture en kWh.
+      # Les facteurs kg/ke ci-dessous ramènent tout en kWh en lisant l'unité
+      # réelle de l'entité, pour ne pas se faire piéger si elle change.
+      #
+      # Attention : les kWh réseau viennent de la pince Shelly (temps réel),
+      # pas de l'index Enedis (exact mais à J-4). Un écart de quelques % avec
+      # la facture est normal et attendu.
+      # =====================================================================
+
+      - name: "Coût énergie jour"
+        unique_id: cout_energie_jour
+        unit_of_measurement: "€"
+        state_class: total
+        availability: >
+          {{ has_value('sensor.linky_25348914432154_off_peak_hours_rate')
+             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
+        state: >
+          {% set abo = state_attr('sensor.linky_25348914432154_latest_reading', 'cout_abonnement_euro') | float(0.628) %}
+          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
+          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set ug = state_attr('sensor.grid_reseau_jour_hc', 'unit_of_measurement') %}
+          {% set ue = state_attr('sensor.evse_voiture_jour_hc', 'unit_of_measurement') %}
+          {% set kg = 1000 if ug == 'MWh' else (0.001 if ug == 'Wh' else 1) %}
+          {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
+          {% set g_hc = states('sensor.grid_reseau_jour_hc') | float(0) * kg %}
+          {% set g_hp = states('sensor.grid_reseau_jour_hp') | float(0) * kg %}
+          {% set k = states('input_number.rendement_borne') | float(0.9686)
+                    * (states('input_number.part_bonus_octopus') | float(0.867)) %}
+          {% set e_hc = states('sensor.evse_voiture_jour_hc') | float(0) * ke * k %}
+          {% set e_hp = states('sensor.evse_voiture_jour_hp') | float(0) * ke * k %}
+          {{ (abo
+              + g_hc * r_hc + g_hp * r_hp
+              - e_hc * (r_hc - 0.08) - e_hp * (r_hp - 0.08)) | round(2) }}
+
+      - name: "Coût énergie mois"
+        unique_id: cout_energie_mois
+        unit_of_measurement: "€"
+        state_class: total
+        availability: >
+          {{ has_value('sensor.linky_25348914432154_off_peak_hours_rate')
+             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
+        state: >
+          {% set abo = state_attr('sensor.linky_25348914432154_latest_reading', 'cout_abonnement_euro') | float(0.628) %}
+          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
+          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set ug = state_attr('sensor.grid_reseau_mois_hc', 'unit_of_measurement') %}
+          {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
+          {% set kg = 1000 if ug == 'MWh' else (0.001 if ug == 'Wh' else 1) %}
+          {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
+          {% set g_hc = states('sensor.grid_reseau_mois_hc') | float(0) * kg %}
+          {% set g_hp = states('sensor.grid_reseau_mois_hp') | float(0) * kg %}
+          {% set k = states('input_number.rendement_borne') | float(0.9686)
+                    * (states('input_number.part_bonus_octopus') | float(0.867)) %}
+          {% set e_hc = states('sensor.evse_voiture_mois_hc') | float(0) * ke * k %}
+          {% set e_hp = states('sensor.evse_voiture_mois_hp') | float(0) * ke * k %}
+          {{ (abo * now().day
+              + g_hc * r_hc + g_hp * r_hp
+              - e_hc * (r_hc - 0.08) - e_hp * (r_hp - 0.08)) | round(2) }}
