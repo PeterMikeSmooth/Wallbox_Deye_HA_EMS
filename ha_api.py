@@ -42,6 +42,13 @@ NUMBER_MAX_CHARGING_CURRENT = "number.deye_battery_max_charging_current"
 NUMBER_MAX_DISCHARGING_CURRENT = "number.deye_battery_max_discharging_current"
 NUMBER_WALLBOX_MAX_CURRENT = "number.wallbox_pulsar_max_sn_429953_maximum_charging_current"
 
+# Local BLE gateway (ESP32-S3 running botts7/esp32-wallbox, HACS integration
+# ``wallbox_gateway``).  The entity ids embed the gateway's IP: they change if
+# its DHCP lease does.  Only the current setpoint goes through it for now —
+# the plug state is still read from the cloud (SENSOR_WALLBOX_STATUS).
+GW_BLE_CONNECTED = "binary_sensor.wallbox_192_168_8_188_ble_connected"
+GW_NUMBER_MAX_CURRENT = "number.wallbox_192_168_8_188_max_current"
+
 
 class HomeAssistantAPI:
     """Thin wrapper around the HA REST API."""
@@ -159,7 +166,11 @@ class HomeAssistantAPI:
         self.set_number(NUMBER_MAX_DISCHARGING_CURRENT, amps)
 
     def set_wallbox_current(self, amps: int) -> None:
+        """Cloud path only — the EMS goes through ``WallboxCurrent``."""
         self.set_number(NUMBER_WALLBOX_MAX_CURRENT, amps)
+
+    def set_wallbox_current_ble(self, amps: int) -> None:
+        self.set_number(GW_NUMBER_MAX_CURRENT, amps)
 
     def set_input_number(self, entity_id: str, value: float) -> None:
         """Call input_number.set_value service."""

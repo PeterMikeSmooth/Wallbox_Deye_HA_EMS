@@ -21,6 +21,7 @@ from datetime import date, datetime
 
 import config
 from ha_api import HomeAssistantAPI
+from wallbox_current import WallboxCurrent
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +201,7 @@ def is_off_peak() -> bool:
 class EMS:
     def __init__(self, ha: HomeAssistantAPI):
         self.ha = ha
+        self.wallbox = WallboxCurrent(ha)   # BLE gateway first, cloud fallback
         self.state = State.IDLE
         self._ema_discharge = None          # smoothed discharge current (A)
         self._last_written_discharge = None  # last integer written to HA
@@ -246,9 +248,9 @@ class EMS:
                 self._pending_batt_prio_date,
             )
         # Force safe wallbox default on startup
-        self.ha.set_wallbox_current(config.WALLBOX_MIN_CURRENT_A)
+        path = self.wallbox.set_current(config.WALLBOX_MIN_CURRENT_A)
         self._last_written_wallbox = config.WALLBOX_MIN_CURRENT_A
-        log.info("SET wallbox_current = %d A (startup)", config.WALLBOX_MIN_CURRENT_A)
+        log.info("SET wallbox_current = %d A (startup, %s)", config.WALLBOX_MIN_CURRENT_A, path)
 
     # -- entry actions --------------------------------------------------------
 
@@ -410,9 +412,9 @@ class EMS:
 
     def _set_wallbox(self, amps: int) -> None:
         # Always write — the wallbox cloud integration may override our value
-        self.ha.set_wallbox_current(amps)
+        path = self.wallbox.set_current(amps)
         if self._last_written_wallbox != amps:
-            log.info("SET wallbox_current = %d A", amps)
+            log.info("SET wallbox_current = %d A (%s)", amps, path)
             self._last_written_wallbox = amps
 
     def _set_grid_ratio(self, pct: int) -> None:
@@ -520,9 +522,9 @@ class EMS:
                     actual_w, expected_w,
                 )
                 # Send target+1, then target to force a state change
-                self.ha.set_wallbox_current(target + 1)
+                self.wallbox.set_current(target + 1)
                 time.sleep(2)
-                self.ha.set_wallbox_current(target)
+                self.wallbox.set_current(target)
                 # Reset timer to wait another confirmation period
                 self._wallbox_override_since = time.monotonic()
         else:
@@ -1476,6 +1478,9 @@ class EMS:
 
         # 7. Verify the inverter actually kept our discharge setpoint
         self._reconcile_discharge(s)
+
+        # 8. Verify the last BLE wallbox write landed; replay it via the cloud if not
+        self.wallbox.poll()
 
 
 # ---------------------------------------------------------------------------
