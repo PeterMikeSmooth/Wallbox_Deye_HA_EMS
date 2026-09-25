@@ -17,7 +17,7 @@ import os
 import time
 import sys
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import config
 from ha_api import HomeAssistantAPI
@@ -225,7 +225,8 @@ class EMS:
         # Overnight range tracking — two-phase state machine (see _track_overnight_range)
         self._overnight_phase = "WAIT_FOR_NIGHT"  # WAIT_FOR_NIGHT | WAIT_FOR_DAYLIGHT
         self._soc_overnight_start = None          # SOC captured at dusk (last sub-threshold crossing)
-        self._solar_was_available = True          # previous tick solar state (for edge detection)
+        self._overnight_night = None              # _night_key() the dusk SOC belongs to
+        self._solar_was_available = None          # previous tick solar state; None = first tick
         # SOLAR_ONLY Tesla pause — the "paused" flag is persisted so a restart
         # of ems.service never leaves the car switched off for the whole day.
         self._tesla_low_sun_since = None    # monotonic ts of the first low-sun tick
@@ -248,6 +249,18 @@ class EMS:
                 "BATT PRIO: restored from %s — target %.0f%% pending since %s",
                 TESLA_STATE_FILE, self._pending_batt_prio,
                 self._pending_batt_prio_date,
+            )
+        # Overnight tracking — persisted so a restart neither re-captures the
+        # dusk SOC (2026-09-25: a 21:10 deploy replaced 84 % by 78 %, hiding
+        # 2 h of evening drain) nor, after 01:00, loses the pre-dawn phase.
+        # Only restored for the night it was captured for.
+        if persisted.get("overnight_night") == self._night_key():
+            self._overnight_phase = persisted.get("overnight_phase") or "WAIT_FOR_NIGHT"
+            self._soc_overnight_start = persisted.get("soc_overnight_start")
+            self._overnight_night = persisted["overnight_night"]
+            log.info(
+                "OVERNIGHT: restored from %s — phase %s, SOC at dusk = %s%%",
+                TESLA_STATE_FILE, self._overnight_phase, self._soc_overnight_start,
             )
         # Force safe wallbox default on startup
         path = self.wallbox.set_current(config.WALLBOX_MIN_CURRENT_A)
@@ -548,6 +561,17 @@ class EMS:
     _SAFETY_MARGIN = 10  # Extra margin above overnight need (%)
     _PREDAWN_HOUR = 1  # local hour: lock dusk SOC and start watching for daylight
 
+    @staticmethod
+    def _night_key() -> str:
+        """Date of the evening the current night belongs to (noon to noon)."""
+        return (datetime.now() - timedelta(hours=12)).date().isoformat()
+
+    def _capture_dusk(self, soc: float, how: str) -> None:
+        self._soc_overnight_start = soc
+        self._overnight_night = self._night_key()
+        log.info("DUSK: %s, SOC at dusk = %.0f%%", how, soc)
+        self._save_state_file()
+
     def _track_overnight_range(self, s: dict) -> None:
         """Compute overnight battery drain with a two-phase state machine.
 
@@ -572,14 +596,26 @@ class EMS:
         soc = s["battery_soc"]
         hour = datetime.now().hour
 
+        if self._solar_was_available is None:
+            # First tick after a start: there is no edge to read.  It used to
+            # count as one (the flag started True), so any evening restart
+            # re-captured the dusk SOC.  Now only an evening start with no
+            # dusk SOC restored for tonight captures — the best estimate left.
+            if (not solar_available and hour >= 12
+                    and self._overnight_phase == "WAIT_FOR_NIGHT"
+                    and self._overnight_night != self._night_key()):
+                self._capture_dusk(soc, "no sun at startup and none persisted")
+            self._solar_was_available = solar_available
+            return
+
         if self._overnight_phase == "WAIT_FOR_NIGHT":
             # Falling edge: solar just dropped below threshold → record dusk SOC.
             if self._solar_was_available and not solar_available:
-                self._soc_overnight_start = soc
-                log.info("DUSK: solar dropped below threshold, SOC at dusk = %.0f%%", soc)
+                self._capture_dusk(soc, "solar dropped below threshold")
             # At 01:00, lock in the dusk SOC and wait for sunrise.
             if hour == self._PREDAWN_HOUR and self._soc_overnight_start is not None:
                 self._overnight_phase = "WAIT_FOR_DAYLIGHT"
+                self._save_state_file()
                 log.info(
                     "OVERNIGHT: pre-dawn reached — SOC at dusk = %.0f%%, "
                     "waiting for daylight", self._soc_overnight_start,
@@ -612,6 +648,7 @@ class EMS:
                 except Exception:
                     log.warning("Failed to set overnight range helpers", exc_info=True)
                 self._overnight_phase = "WAIT_FOR_NIGHT"
+                self._save_state_file()
 
         self._solar_was_available = solar_available
 
@@ -672,7 +709,10 @@ class EMS:
                 json.dump({"tesla_paused": self._tesla_paused,
                            "tesla_paused_at": self._tesla_paused_at,
                            "pending_batt_prio": self._pending_batt_prio,
-                           "pending_batt_prio_date": self._pending_batt_prio_date},
+                           "pending_batt_prio_date": self._pending_batt_prio_date,
+                           "overnight_phase": self._overnight_phase,
+                           "soc_overnight_start": self._soc_overnight_start,
+                           "overnight_night": self._overnight_night},
                           fh)
         except Exception:
             log.warning("Could not persist %s", TESLA_STATE_FILE, exc_info=True)
