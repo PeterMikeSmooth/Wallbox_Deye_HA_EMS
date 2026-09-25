@@ -214,7 +214,9 @@ class EMS:
         self._storage_low_soc = False       # STORAGE_TO_EV: SOC below floor
         self._car_connected = None          # wallbox: car plugged in (None = unknown yet)
         self._ev_id_generation = 0          # bumped on every plug/unplug edge
-        self._last_wallbox_status = None    # last logged wallbox status string
+        self._last_wallbox_status = None    # last logged wallbox status string (cloud)
+        self._last_gw_status = None         # last logged gateway charger_status
+        self._plug_seen = None              # plug change read once, awaiting confirmation
         self._last_written_grid_ratio = None
         self._battery_voltage = 52.0        # last known battery voltage
         # Wallbox override detection
@@ -1088,12 +1090,11 @@ class EMS:
     def _reset_mode_on_unplug(self, s: dict, status: str) -> None:
         """Car unplugged: hand the next session back the default mode.
 
-        Fired on the falling edge of :meth:`_car_plugged`, which in practice
-        means "the wallbox just reported a bare Locked while a car was
-        plugged".  Doing this at unplug rather than at plug-in means the user
-        can plug in, pick FULL_SPEED and never see it wiped under them; it also
-        makes the detection latency free, since the mode is only consumed by
-        the *next* session.
+        Fired on the falling edge of :meth:`_car_plugged`, i.e. when the BLE
+        gateway's ``car_connected`` drops to off.  Doing this at unplug rather
+        than at plug-in means the user can plug in, pick FULL_SPEED and never
+        see it wiped under them; it also makes the detection latency free,
+        since the mode is only consumed by the *next* session.
 
         ``ev_power`` can only veto, never confirm: power flowing proves a car
         is there, but a car sitting idle draws the same ~6 W as an empty cable,
@@ -1102,11 +1103,11 @@ class EMS:
         """
         if s["ev_power"] > config.EV_CHARGING_DETECT_W:
             log.info(
-                "Car unplugged per wallbox (%r) but EV still draws %.0f W — "
+                "Car unplugged per gateway (%r) but EV still draws %.0f W — "
                 "mode left untouched", status, s["ev_power"],
             )
             return
-        log.info("Car unplugged (wallbox: %r) — resetting ems_mode to %s",
+        log.info("Car unplugged (gateway: %r) — resetting ems_mode to %s",
                  status, config.DEFAULT_EMS_MODE)
         self._write_ev_connected(EV_NONE)
         try:
@@ -1116,53 +1117,32 @@ class EMS:
             log.warning("Failed to reset ems_mode", exc_info=True)
 
     @staticmethod
-    def _car_plugged(status: str) -> bool | None:
-        """Is a car plugged in?  ``None`` when the status is not conclusive.
+    def _car_plugged(s: dict) -> bool | None:
+        """Is a car plugged in?  ``None`` when the answer is not conclusive.
 
-        Classification learned from 9 days of history by labelling every
-        ``status_description`` sample with ``sensor.wallbox_pulsar_max_charging_status``
-        (SMART_CONTROL_IN_PROGRESS / _CAPABLE = plugged, _NOT_AVAILABLE =
-        unplugged), measured as real interval overlap:
+        Read from the BLE gateway (``car_connected``), not from the cloud
+        ``status_description`` any more.  The cloud status used to be
+        classified here (Locked/Ready = no car, learned from 9 days of history,
+        see MEMO §6bis), but it polls every 90 s and can freeze: on 2026-09-25
+        at 16:41 it went to "Ready" when the Ioniq was unplugged and stayed
+        there while the Tesla, plugged one minute later, charged at 1.2 kW —
+        so no plug-in edge, and ev_connected stuck on "disconnected".
 
-            Locked                  0.1 h plugged / 109.3 h unplugged
-            Waiting for car demand 24.8 h plugged /   0.0 h unplugged
-            Locked, car connected  20.3 h plugged /   0.0 h unplugged
-            Waiting                19.6 h plugged /   0.0 h unplugged
-            Charging               17.9 h plugged /   0.0 h unplugged
-            Ready                   1.0 h plugged /   0.4 h unplugged  <- ambiguous
-            Disconnected            0.3 h plugged /   1.0 h unplugged  <- ambiguous
+        Since pairing (2026-09-24 18:17 → 09-25 14:42) the gateway matched all
+        6 plug-ins and 5 unplugs, 1 to 80 s ahead of the cloud, with no flap
+        during a charge.
 
-        "Locked" and "Ready" both mean "no car"; "Disconnected" and
-        "unavailable" are inconclusive and must never demote a plugged state,
-        being the shapes a cloud dropout takes.
-
-        The time-weighted table above makes "Ready" look ambiguous, but that
-        is the 5-minute-polled label lagging, not the status.  Replayed as
-        *edges*, which is how it is actually used, every single "Ready"
-        reached from a plugged state was a real unplug (2026-09-22): four with
-        the line at 7-8 W for the next hour, three where power returned only
-        because another car was plugged in one to two minutes later.  Treating
-        it as conclusive finds 18 unplugs over the window instead of 17, two
-        of them 6 and 7 minutes sooner, and loses none.
-
-        No delay is needed before trusting it.  The dangerous case — a car
-        mid-charge — always shows itself through ev_power, and that veto lives
-        in :meth:`_reset_mode_on_unplug`.
-
-        "Ready" reached from an already-unplugged state is just chatter
-        between two no-car statuses: it produces no edge, because the
-        remembered state is already False.
-
-        Plugged is checked first so "Locked, car connected" wins over the bare
-        "Locked"; both no-car statuses are matched exactly, not as substrings.
+        ``off`` is only trusted once the gateway has heard from the charger:
+        the firmware reports ``car_connected = false`` by default, before any
+        data.  Seen right after a gateway reboot (09-24 18:15): "off" for two
+        minutes with ``charger_status = unknown`` while the Ioniq was charging.
+        Unknown/unavailable therefore leave the remembered state untouched —
+        they cannot fabricate an edge, exactly like "Disconnected" and
+        "unavailable" on the old cloud status.
         """
-        st = status.strip().lower()
-        if any(k in st for k in ("charging", "car connected", "connected:",
-                                 "waiting", "discharging", "paused", "queue")):
-            return True
-        if st in ("locked", "ready"):
-            return False
-        return None
+        if s.get("gw_charger_status") in (None, "unknown", "unavailable"):
+            return None
+        return {"on": True, "off": False}.get(s.get("gw_car_connected"))
 
     # -- state evaluation -----------------------------------------------------
 
@@ -1265,25 +1245,53 @@ class EMS:
         self._battery_voltage = s.get("battery_voltage", self._battery_voltage)
 
         # 0. Detect the end of a session → reset mode to default
+        # Both statuses are logged: the cloud one no longer drives anything,
+        # but it is what the 9-day history behind the old rule was built on.
         status = s.get("wallbox_status", "")
         if status != self._last_wallbox_status:
             log.info("Wallbox status: %r → %r", self._last_wallbox_status, status)
             self._last_wallbox_status = status
+        gw_status = s.get("gw_charger_status")
+        if gw_status != self._last_gw_status:
+            log.info("Gateway status: %r → %r (car_connected=%s)",
+                     self._last_gw_status, gw_status, s.get("gw_car_connected"))
+            self._last_gw_status = gw_status
+        status = gw_status
 
-        plugged = self._car_plugged(status)
+        plugged = self._car_plugged(s)
+        # A change must be read on two ticks in a row.  HA publishes
+        # car_connected and charger_status one after the other, and our two
+        # GETs can land in between: a stale "off" paired with a fresh known
+        # status would be a false unplug.
+        if plugged is not None and plugged != self._car_connected:
+            if self._plug_seen != plugged:
+                self._plug_seen = plugged
+                plugged = None
+        elif plugged is not None:
+            self._plug_seen = None
         if plugged is not None:
             # Edges are taken between *conclusive* states only.  An
-            # inconclusive status leaves _car_connected untouched, so the
-            # "Ready"/"Disconnected" chatter cannot fabricate an edge.
+            # inconclusive reading leaves _car_connected untouched, so a
+            # gateway reboot or an HA restart cannot fabricate an edge.
             if plugged != self._car_connected and self._car_connected is not None:
                 self._ev_id_generation += 1
             if plugged and self._car_connected is False:
                 # Plug-in: observation only.  The mode is deliberately left
                 # alone so the user can pick one while the car sits waiting.
-                log.info("Car plugged in (wallbox: %r) — mode left untouched", status)
+                log.info("Car plugged in (gateway: %r) — mode left untouched", status)
                 self._identify_plugged_car()
             elif not plugged and self._car_connected is True:
                 self._reset_mode_on_unplug(s, status)
+            elif self._car_connected is None:
+                # First conclusive reading since start: no edge, but
+                # ev_connected may be stale from before the restart.  The
+                # mode is not touched either way.
+                log.info("Car %s at startup (gateway: %r)",
+                         "plugged" if plugged else "not plugged", status)
+                if plugged:
+                    self._identify_plugged_car()
+                else:
+                    self._write_ev_connected(EV_NONE)
             self._car_connected = plugged
 
         # 1. Evaluate state machine

@@ -17,9 +17,8 @@ set: BLE "connected", 200+ requests sent, zero received.  So a BLE write only
 counts once ``number.<gateway>_max_current`` shows it — and that entity only
 has a value once the charger has answered at least once.
 
-Only the setpoint goes through here.  The plug state is still read from the
-cloud: the gateway's own ``car_connected`` / ``charger_status`` have not been
-validated against the unplug rule yet (see MEMO §6bis).
+Only the setpoint goes through here.  The plug state is read from the
+gateway directly by ``EMS._car_plugged`` — with no cloud fallback.
 """
 
 import logging
@@ -113,12 +112,7 @@ class WallboxCurrent:
             return None
 
     def _state(self, entity_id: str) -> str | None:
-        # Not get_text_state_safe(): it logs a traceback, and a removed gateway
-        # would then flood the log once a minute.
-        try:
-            return self.ha.get_text_state(entity_id)
-        except Exception:
-            return None
+        return self.ha.get_text_state_quiet(entity_id)
 
     def _bench(self, now: float, why: str) -> None:
         self._benched_until = now + BLE_RETRY_S

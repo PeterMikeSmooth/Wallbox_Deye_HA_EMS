@@ -44,10 +44,13 @@ NUMBER_WALLBOX_MAX_CURRENT = "number.wallbox_pulsar_max_sn_429953_maximum_chargi
 
 # Local BLE gateway (ESP32-S3 running botts7/esp32-wallbox, HACS integration
 # ``wallbox_gateway``).  The entity ids embed the gateway's IP: they change if
-# its DHCP lease does.  Only the current setpoint goes through it for now —
-# the plug state is still read from the cloud (SENSOR_WALLBOX_STATUS).
+# its DHCP lease does.  The current setpoint goes through it first (cloud as
+# fallback, see wallbox_current.py) and the plug state is read from it only;
+# SENSOR_WALLBOX_STATUS (cloud) is kept for the log.
 GW_BLE_CONNECTED = "binary_sensor.wallbox_192_168_8_188_ble_connected"
 GW_NUMBER_MAX_CURRENT = "number.wallbox_192_168_8_188_max_current"
+GW_CAR_CONNECTED = "binary_sensor.wallbox_192_168_8_188_car_connected"
+GW_CHARGER_STATUS = "sensor.wallbox_192_168_8_188_charger_status"
 
 
 class HomeAssistantAPI:
@@ -94,6 +97,17 @@ class HomeAssistantAPI:
             logger.warning("Could not read %s", entity_id, exc_info=True)
             return None
 
+    def get_text_state_quiet(self, entity_id: str) -> str | None:
+        """Like :meth:`get_text_state_safe` but without logging.
+
+        For entities read at 1 Hz whose absence is survivable: a removed
+        integration would otherwise log a traceback every second.
+        """
+        try:
+            return self.get_text_state(entity_id)
+        except Exception:
+            return None
+
     def read_all_sensors(self) -> dict:
         """Read every sensor needed in one batch and return a dict."""
         return {
@@ -109,6 +123,8 @@ class HomeAssistantAPI:
             "discharge_limit": self.get_state(SENSOR_DISCHARGE_LIMIT),
             "ems_mode": self.get_text_state(SENSOR_EMS_MODE),
             "wallbox_status": self.get_text_state(SENSOR_WALLBOX_STATUS),
+            "gw_car_connected": self.get_text_state_quiet(GW_CAR_CONNECTED),
+            "gw_charger_status": self.get_text_state_quiet(GW_CHARGER_STATUS),
             # Read-back of our own setpoint: the inverter does not always keep
             # what we write (see _reconcile_discharge in ems.py).
             "max_discharging_actual": self.get_state(NUMBER_MAX_DISCHARGING_CURRENT),
