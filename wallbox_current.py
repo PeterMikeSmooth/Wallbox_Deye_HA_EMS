@@ -39,6 +39,7 @@ class WallboxCurrent:
         self.ha = ha
         self._benched_until = 0.0   # monotonic ts before which BLE is not tried
         self._pending = None        # (amps, monotonic ts) of an unverified BLE write
+        self._strikes = 0           # consecutive read-backs that did not match
         self._path = None           # "ble" | "cloud" — to log changes only
 
     def set_current(self, amps: int) -> str:
@@ -75,7 +76,12 @@ class WallboxCurrent:
 
         Called every fast tick so that a lost write is caught ~20 s later even
         when no other write follows (MANUAL mode writes once, then hands off).
-        A lost write is replayed through the cloud.
+
+        A first mismatch is re-sent over BLE, not blamed on the gateway: the
+        charger resets its own current to 32 A at every unplug (5 unplugs out
+        of 5 since pairing), so a correct write can be overwritten under us.
+        Only a second mismatch in a row benches BLE and replays the value
+        through the cloud.
         """
         if self._pending is None:
             return
@@ -86,8 +92,22 @@ class WallboxCurrent:
         self._pending = None
         seen = self._read_setpoint()
         if seen == amps:
+            self._strikes = 0
             return
-        self._bench(now, f"{amps} A not confirmed after {BLE_VERIFY_S} s (gateway reports {seen})")
+        self._strikes += 1
+        why = f"{amps} A not confirmed after {BLE_VERIFY_S} s (gateway reports {seen})"
+        if self._strikes < 2:
+            if not replay:
+                return   # set_current() is about to write a newer value anyway
+            log.info("WALLBOX BLE: %s — re-sending over BLE", why)
+            try:
+                self.ha.set_wallbox_current_ble(amps)
+            except Exception as exc:
+                why = f"re-send rejected ({exc})"
+            else:
+                self._pending = (amps, now)
+                return
+        self._bench(now, why)
         if replay:
             self.ha.set_wallbox_current(amps)
             self._use("cloud", "BLE write not confirmed")
@@ -117,6 +137,7 @@ class WallboxCurrent:
     def _bench(self, now: float, why: str) -> None:
         self._benched_until = now + BLE_RETRY_S
         self._pending = None
+        self._strikes = 0
         log.warning(
             "WALLBOX BLE: %s — cloud fallback for %d s", why, BLE_RETRY_S,
         )
