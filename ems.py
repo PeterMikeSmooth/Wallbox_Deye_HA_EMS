@@ -1156,33 +1156,50 @@ class EMS:
         except Exception:
             log.warning("Failed to reset ems_mode", exc_info=True)
 
-    @staticmethod
-    def _car_plugged(s: dict) -> bool | None:
+    # Gateway charger_status labels (r_sta.charger_status, as named by the
+    # wallbox_gateway integration) that say a car is on the cable, and the two
+    # that say none is.  Measured 2026-09-24 → 10-01 against the cloud
+    # charging_status (SMART_CONTROL_*): Locked 0.03 h plugged / 120 h not,
+    # "Ready" chatters with Locked for hours after an unplug, and every other
+    # label seen (Charging, Connected — …, OCPP charge finishing) only with a
+    # car.  Anything else (Error, Updating, …) is inconclusive.
+    _GW_NO_CAR = ("Locked", "Ready")
+    _GW_CAR = ("Charging", "Paused", "Schedule end", "Queued by Power Boost",
+               "Queued by Eco-Smart", "Discharging", "OCPP charge finishing",
+               "MID safety margin exceeded")
+
+    @classmethod
+    def _car_plugged(cls, s: dict) -> bool | None:
         """Is a car plugged in?  ``None`` when the answer is not conclusive.
 
-        Read from the BLE gateway (``car_connected``), not from the cloud
-        ``status_description`` any more.  The cloud status used to be
-        classified here (Locked/Ready = no car, learned from 9 days of history,
-        see MEMO §6bis), but it polls every 90 s and can freeze: on 2026-09-25
-        at 16:41 it went to "Ready" when the Ioniq was unplugged and stayed
-        there while the Tesla, plugged one minute later, charged at 1.2 kW —
-        so no plug-in edge, and ev_connected stuck on "disconnected".
+        Read from the BLE gateway, not from the cloud ``status_description``,
+        which polls every 90 s and can freeze (2026-09-25 16:41: stuck on
+        "Ready" while the Tesla charged at 1.2 kW, so no plug-in edge).
 
-        Since pairing (2026-09-24 18:17 → 09-25 14:42) the gateway matched all
-        6 plug-ins and 5 unplugs, 1 to 80 s ahead of the cloud, with no flap
-        during a charge.
+        Two gateway fields, and neither is enough alone:
 
-        ``off`` is only trusted once the gateway has heard from the charger:
-        the firmware reports ``car_connected = false`` by default, before any
-        data.  Seen right after a gateway reboot (09-24 18:15): "off" for two
-        minutes with ``charger_status = unknown`` while the Ioniq was charging.
-        Unknown/unavailable therefore leave the remembered state untouched —
-        they cannot fabricate an edge, exactly like "Disconnected" and
-        "unavailable" on the old cloud status.
+        - ``car_connected`` is the firmware's own flag, from ``r_dat.st``.  It
+          never claimed a car that was not there, but it drops to off with the
+          car still plugged when the charger reports a code missing from its
+          list: st 15 at the end of a charge (10-01 17:17, Ioniq full, still
+          plugged — ev_connected went to "disconnected" and the mode was
+          reset), and 12 s blips at the start of a charge (09-30 14:29,
+          10-01 16:59).  It also reads off before the gateway has any data.
+        - the ``charger_status`` label comes from a separate read
+          (``r_sta.charger_status``).  In all three false offs it still named
+          a car ("OCPP charge finishing", "Connected — …").
+
+        So: a car if either says so; no car only if the flag is off **and**
+        the label is Locked or Ready.  A real unplug is then seen once the
+        label follows, 10 to 26 s after the flag.
         """
-        if s.get("gw_charger_status") in (None, "unknown", "unavailable"):
-            return None
-        return {"on": True, "off": False}.get(s.get("gw_car_connected"))
+        label = s.get("gw_charger_status")
+        flag = s.get("gw_car_connected")
+        if flag == "on" or label in cls._GW_CAR or (label or "").startswith("Connected"):
+            return True
+        if flag == "off" and label in cls._GW_NO_CAR:
+            return False
+        return None
 
     # -- state evaluation -----------------------------------------------------
 
