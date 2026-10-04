@@ -211,7 +211,7 @@ class EMS:
         self._last_written_wallbox = None
         self._last_written_charging = None
         self._last_slow_tick = 0.0          # timestamp of last slow-loop action
-        self._storage_low_soc = False       # STORAGE_TO_EV: SOC below floor
+        self._storage_low_soc = False       # MANUAL: SOC below discharge_limit
         self._car_connected = None          # wallbox: car plugged in (None = unknown yet)
         self._ev_id_generation = 0          # bumped on every plug/unplug edge
         self._last_wallbox_status = None    # last logged wallbox status string (cloud)
@@ -316,7 +316,6 @@ class EMS:
         log.info("→ STORAGE_BOOSTED")
         self.state = State.STORAGE_BOOSTED
         self._ema_discharge = None
-        self._storage_low_soc = False
         self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
         self._last_slow_tick = time.monotonic()
 
@@ -324,7 +323,6 @@ class EMS:
         log.info("→ STORAGE_ONLY")
         self.state = State.STORAGE_ONLY
         self._ema_discharge = None
-        self._storage_low_soc = False
         self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
         self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
         self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
@@ -1203,20 +1201,34 @@ class EMS:
 
     # -- state evaluation -----------------------------------------------------
 
-    def _force_solar_only_on_low_soc(self, s: dict) -> State:
-        """SOC floor reached in a storage mode: fall back to SOLAR_ONLY.
+    def _leave_storage_on_low_soc(self, s: dict, mode: str) -> State:
+        """SOC floor reached in a storage mode: switch to its grid cousin.
 
-        This overrides a choice the user is actively making, so it targets
-        SOLAR_ONLY literally rather than ``DEFAULT_EMS_MODE``: it is a battery
-        protection, not a return to the default — unlike
-        :meth:`_reset_mode_on_unplug`, which ends a session.
+        The two storage modes differ by whether the grid may feed the car,
+        and each falls back to the mode that keeps that promise:
+
+        - STORAGE_BOOSTED (battery + grid) → FULL_SPEED (grid; below
+          discharge_limit the battery only covers the house, see FULL_SPEED);
+        - STORAGE_ONLY (no grid) → SOLAR_ONLY.
+
+        The helper is rewritten so the dashboard shows it, and the choice
+        sticks: the EMS does not return to the storage mode when the SOC
+        recovers.  This overrides what the user picked, so it targets the
+        cousin literally rather than ``DEFAULT_EMS_MODE``: it is a battery
+        protection, not the end of a session like
+        :meth:`_reset_mode_on_unplug`.
         """
-        self.ha.set_ems_mode("SOLAR_ONLY")
-        s["ems_mode"] = "SOLAR_ONLY"
-        log.info("SOC <= discharge_limit — forcing ems_mode to SOLAR_ONLY")
-        if s["solar_power"] > config.SOLAR_AVAILABLE_W:
-            return State.SOLAR_ONLY
-        return State.EV_NO_SOLAR
+        if mode == "STORAGE_BOOSTED":
+            new_mode, state = "FULL_SPEED", State.FULL_SPEED
+        elif s["solar_power"] > config.SOLAR_AVAILABLE_W:
+            new_mode, state = "SOLAR_ONLY", State.SOLAR_ONLY
+        else:
+            new_mode, state = "SOLAR_ONLY", State.EV_NO_SOLAR
+        self.ha.set_ems_mode(new_mode)
+        s["ems_mode"] = new_mode
+        log.info("SOC %.0f%% <= discharge_limit %.0f%% — %s → %s",
+                 s["battery_soc"], s["discharge_limit"], mode, new_mode)
+        return state
 
     def _determine_target_state(self, s: dict) -> State:
         """Determine the target state based on current sensor readings."""
@@ -1235,7 +1247,7 @@ class EMS:
 
         if mode in ("STORAGE_BOOSTED", "STORAGE_ONLY"):
             if s["battery_soc"] <= s["discharge_limit"]:
-                return self._force_solar_only_on_low_soc(s)
+                return self._leave_storage_on_low_soc(s, mode)
             return State.STORAGE_BOOSTED if mode == "STORAGE_BOOSTED" else State.STORAGE_ONLY
 
         # SOLAR_ONLY / SOLAR_BOOSTED share routing
@@ -1413,81 +1425,46 @@ class EMS:
                 )
 
         elif self.state == State.STORAGE_BOOSTED:
-            soc = s["battery_soc"]
-            soc_floor = s["discharge_limit"]
-            # SOC floor with hysteresis (floor stop, floor+2 resume)
-            if self._storage_low_soc:
-                if soc >= soc_floor + 2:
-                    self._storage_low_soc = False
-                    log.info("STORAGE_BOOSTED: SOC recovered above floor, resuming")
-            elif soc < soc_floor:
-                self._storage_low_soc = True
-                log.info("STORAGE_BOOSTED: SOC below %.0f%%, stopping",
-                         soc_floor)
-                self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
-                self._set_max_discharging(0, force=True)
-                self._ema_discharge = None
-
-            if self._storage_low_soc:
-                self._set_max_discharging(0, force=True)
-            else:
-                off_peak = is_off_peak()
-                grid_ratio = config.BOOSTED_GRID_RATIO_OFF_PEAK if off_peak else config.BOOSTED_GRID_RATIO_PEAK
-                amps = self._compute_storage_discharge(s, grid_ratio)
-                self._set_max_discharging(amps)
-                # Re-send wallbox 32A periodically (cloud may override)
-                now = time.monotonic()
-                if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
-                    self._last_slow_tick = now
-                    self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
+            # No SOC floor here: _determine_target_state leaves the mode for
+            # FULL_SPEED as soon as SOC <= discharge_limit.
+            off_peak = is_off_peak()
+            grid_ratio = config.BOOSTED_GRID_RATIO_OFF_PEAK if off_peak else config.BOOSTED_GRID_RATIO_PEAK
+            amps = self._compute_storage_discharge(s, grid_ratio)
+            self._set_max_discharging(amps)
+            # Re-send wallbox 32A periodically (cloud may override)
+            now = time.monotonic()
+            if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
+                self._last_slow_tick = now
+                self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
 
         elif self.state == State.STORAGE_ONLY:
-            soc = s["battery_soc"]
-            soc_floor = s["discharge_limit"]
-            # SOC floor with hysteresis (floor stop, floor+2 resume)
-            if self._storage_low_soc:
-                if soc >= soc_floor + 2:
-                    self._storage_low_soc = False
-                    log.info("STORAGE_ONLY: SOC recovered, resuming")
-                    self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
-                    self._ema_discharge = None
-            elif soc < soc_floor:
-                self._storage_low_soc = True
-                log.info("STORAGE_ONLY: SOC below %.0f%%, house only",
-                         soc_floor)
-                self._set_wallbox(config.WALLBOX_MIN_CURRENT_A)
-                self._ema_discharge = None
-
-            if self._storage_low_soc:
-                # Battery covers house only
-                amps = self._compute_discharge_limit(s)
-                self._set_max_discharging(amps)
-            else:
-                # Direct calculation: wallbox = (max_discharge + solar - house) / voltage
-                # The Deye inverter keeps grid≈0 on its own, so the incremental
-                # algorithm cannot work (it always sees grid≈0 regardless of wallbox).
-                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
-                now = time.monotonic()
-                if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
-                    self._last_slow_tick = now
-                    house_load = (
-                        s["solar_power"] + s["battery_power"]
-                        + s["grid_power"] - s["ev_power"]
-                    )
-                    available = (
-                        config.MAX_DISCHARGE_POWER_W
-                        + s["solar_power"]
-                        - max(house_load, 0)
-                    )
-                    amps = int(available / max(s["grid_voltage"], 1.0))
-                    amps = int(clamp(amps, config.WALLBOX_MIN_CURRENT_A, config.WALLBOX_MAX_CURRENT_A))
-                    self._set_wallbox(amps)
-                    log.info(
-                        "STORAGE_ONLY steering: grid=%.0fW batt=%.0fW ev=%.0fW "
-                        "solar=%.0fW house=%.0fW avail=%.0fW → wallbox=%dA",
-                        s["grid_power"], s["battery_power"], s["ev_power"],
-                        s["solar_power"], house_load, available, amps,
-                    )
+            # No SOC floor here: _determine_target_state leaves the mode for
+            # SOLAR_ONLY as soon as SOC <= discharge_limit.
+            # Direct calculation: wallbox = (max_discharge + solar - house) / voltage
+            # The Deye inverter keeps grid≈0 on its own, so the incremental
+            # algorithm cannot work (it always sees grid≈0 regardless of wallbox).
+            self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
+            now = time.monotonic()
+            if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
+                self._last_slow_tick = now
+                house_load = (
+                    s["solar_power"] + s["battery_power"]
+                    + s["grid_power"] - s["ev_power"]
+                )
+                available = (
+                    config.MAX_DISCHARGE_POWER_W
+                    + s["solar_power"]
+                    - max(house_load, 0)
+                )
+                amps = int(available / max(s["grid_voltage"], 1.0))
+                amps = int(clamp(amps, config.WALLBOX_MIN_CURRENT_A, config.WALLBOX_MAX_CURRENT_A))
+                self._set_wallbox(amps)
+                log.info(
+                    "STORAGE_ONLY steering: grid=%.0fW batt=%.0fW ev=%.0fW "
+                    "solar=%.0fW house=%.0fW avail=%.0fW → wallbox=%dA",
+                    s["grid_power"], s["battery_power"], s["ev_power"],
+                    s["solar_power"], house_load, available, amps,
+                )
 
         elif self.state == State.MANUAL:
             # Wallbox current is user-controlled — never touched here.

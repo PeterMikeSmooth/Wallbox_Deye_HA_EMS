@@ -198,7 +198,7 @@ The user picks a **mode** via `input_select.ems_mode`. The script maps `(mode, s
 | **STORAGE_ONLY** | Battery+solar → EV, grid = 0. |
 | **MANUAL** | User-controlled wallbox; EMS manages battery only. |
 
-**SOC protection (all storage modes):** if `SOC ≤ discharge_limit`, `STORAGE_BOOSTED` and `STORAGE_ONLY` are automatically forced back to `SOLAR_ONLY` (and the `ems_mode` helper is rewritten so the dashboard reflects it).
+**SOC protection (storage modes):** if `SOC ≤ discharge_limit`, each storage mode switches to its grid cousin and the `ems_mode` helper is rewritten so the dashboard reflects it. `STORAGE_BOOSTED` (battery + grid) → `FULL_SPEED` (grid). `STORAGE_ONLY` (no grid) → `SOLAR_ONLY`. The switch sticks: the EMS does not go back to the storage mode when the SOC recovers.
 
 ---
 
@@ -215,8 +215,10 @@ ev_power ≤ EV_CHARGING_DETECT_W (40 W) ?
      MANUAL      → MANUAL
 
      STORAGE_BOOSTED / STORAGE_ONLY
-        SOC ≤ discharge_limit ? → force SOLAR_ONLY (protection)
-                                   → SOLAR_ONLY if solar > 100 W else EV_NO_SOLAR
+        SOC ≤ discharge_limit ? → protection, ems_mode rewritten:
+                                   STORAGE_BOOSTED → FULL_SPEED
+                                   STORAGE_ONLY    → SOLAR_ONLY
+                                     (SOLAR_ONLY if solar > 100 W else EV_NO_SOLAR)
         else                    → STORAGE_BOOSTED / STORAGE_ONLY
 
      SOLAR_ONLY / SOLAR_BOOSTED
@@ -279,14 +281,14 @@ The `100 W` solar threshold (`SOLAR_AVAILABLE_W`) naturally separates "day" from
 - **Trigger**: `ems_mode = STORAGE_BOOSTED` AND `SOC > discharge_limit`
 - **Entry actions**: `wallbox_current` → 32 A.
 - **Fast loop**: [Storage Discharge Algorithm](#storage-discharge-algorithm) targets `grid = grid_ratio × ev_power`, so the battery covers the complementary share.
-- **SOC floor** (`discharge_limit`, hysteresis +2 %): below it, wallbox → 6 A and discharge → 0 A until SOC recovers.
+- **SOC floor**: at `SOC ≤ discharge_limit` the mode switches to `FULL_SPEED` (see [SOC protection](#modes--states)).
 - The wallbox 32 A setpoint is re-sent every 60 s (the cloud integration may override it).
 
 ### STORAGE_ONLY State (battery + solar → EV, grid = 0)
 
 - **Trigger**: `ems_mode = STORAGE_ONLY` AND `SOC > discharge_limit`
 - **Slow loop (60 s)**: wallbox current is **computed directly** as `(MAX_DISCHARGE_POWER_W + solar − house_load) / grid_voltage`, clamped 6–32 A. The incremental steering can't be used here because the Deye keeps `grid ≈ 0` on its own regardless of wallbox current.
-- **SOC floor** (hysteresis +2 %): below it, battery reverts to house-only discharge and the wallbox drops to 6 A.
+- **SOC floor**: at `SOC ≤ discharge_limit` the mode switches to `SOLAR_ONLY`.
 
 ### MANUAL Mode (user drives the wallbox)
 
@@ -571,7 +573,7 @@ OFF_PEAK_WINDOWS = [
     ((12, 24), (15, 24)),
 ]
 
-# Grid share when boosting
+# Grid share when boosting (SOLAR_BOOSTED and STORAGE_BOOSTED)
 BOOSTED_GRID_RATIO_OFF_PEAK = 0.50   # Off-peak: grid 50 %, solar 50 %
 BOOSTED_GRID_RATIO_PEAK = 0.60       # Peak: grid 60 %, solar 40 %
 
