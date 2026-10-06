@@ -36,6 +36,13 @@ JSONL_OUT = os.path.join(DATA, "octopus_archive.jsonl")
 
 EV_ENERGIE = "sensor.shellyem_34945478aee1_channel_2_energy"
 NOTIFY = "mobile_app_iphone2"
+
+# Déclenchement sur débranchement : Octopus ne comptabilise une charge qu'une
+# quinzaine de minutes APRÈS le débranchement. Un relevé à 5h rate donc la nuit,
+# puisque la voiture reste branchée jusqu'à 6h-7h.
+EV_BRANCHE = "input_text.ev_connected"       # géré par ems.py
+EV_DEBRANCHE = "disconnected"
+DELAI_APRES_DEBRANCHE = dt.timedelta(minutes=15)
 COPIE_NUC = True
 
 # Plages heures creuses du contrat (HC 1H54-6H54 ; 12H24-15H24)
@@ -337,6 +344,43 @@ def copie_nuc(mois):
         print(f"  copie NUC impossible (sans gravité) : {e}")
 
 
+# --------------------------------------------------------------------------- débranchement
+
+def jeton_debranchement():
+    """Retourne le `last_changed` du dernier débranchement s'il faut relever, sinon None.
+
+    Sans état à maintenir : on interroge HA, et un fichier-témoin évite de
+    relever deux fois le même débranchement.
+    """
+    temoin = os.path.join(DATA, "dernier_debranchement.txt")
+    try:
+        r = requests.get(config.HA_URL + "/api/states/" + EV_BRANCHE,
+                         headers={"Authorization": HA["Authorization"]}, timeout=20)
+        d = r.json()
+    except Exception as e:
+        print(f"  lecture {EV_BRANCHE} impossible : {e}")
+        return None
+    if (d.get("state") or "").strip() != EV_DEBRANCHE:
+        return None
+    change = d.get("last_changed")
+    age = dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(change)
+    if age < DELAI_APRES_DEBRANCHE:
+        print(f"  débranché depuis {age.total_seconds()/60:.0f} min, on attend "
+              f"{DELAI_APRES_DEBRANCHE.total_seconds()/60:.0f} min")
+        return None
+    deja = ""
+    if os.path.exists(temoin):
+        deja = open(temoin, encoding="utf-8").read().strip()
+    if deja == change:
+        return None
+    return change
+
+
+def marque_debranchement(change):
+    with open(os.path.join(DATA, "dernier_debranchement.txt"), "w", encoding="utf-8") as fh:
+        fh.write(change)
+
+
 # --------------------------------------------------------------------------- imports
 
 def importe_wallbox(c, chemin):
@@ -418,6 +462,9 @@ def main():
     ap.add_argument("--import-wallbox")
     ap.add_argument("--import-octopus")
     ap.add_argument("--rapport")
+    ap.add_argument("--si-debranche", action="store_true",
+                    help="ne relève que si la voiture est débranchée depuis plus de "
+                         "15 min et que ce débranchement n'a pas déjà été traité")
     ap.add_argument("--capteurs", action="store_true",
                     help="repousse seulement les 3 capteurs HA depuis la base locale "
                          "(aucun appel à Kraken) — sert à les recréer après un "
@@ -440,6 +487,14 @@ def main():
         print(f"  {exporte(c)} lignes exportées")
         return
 
+    change = None
+    if a.si_debranche:
+        change = jeton_debranchement()
+        if not change:
+            print("  rien à faire")
+            return
+        print(f"  débranchement du {change} non traité -> relevé")
+
     try:
         releve(c)
     except Exception as e:
@@ -448,12 +503,14 @@ def main():
             notifie("Archive Octopus en échec", f"Le relevé a échoué : {e}")
         raise SystemExit(1)
 
+    if change:
+        marque_debranchement(change)
     total = exporte(c)
     pousse_capteurs(c)
     print(f"  base : {total} sessions au total")
 
     # Le 1er du mois : résumé du mois écoulé + copie de secours vers le NUC
-    if dt.date.today().day == 1:
+    if dt.date.today().day == 1 and not a.si_debranche:
         veille = dt.date.today() - dt.timedelta(days=1)
         mois = veille.strftime("%Y-%m")
         kwh, hc, hp, bonus, n = bilan(c, mois)

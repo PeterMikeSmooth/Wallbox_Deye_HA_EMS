@@ -379,3 +379,127 @@ template:
                         * (states('input_number.rendement_borne') | float(0.9688)) %}
           {% set o = states('sensor.octopus_smartcharge_mois') | float(0) %}
           {{ (o / borne) | round(4) if (borne > 0 and o > 0) else 0 }}
+
+      # =====================================================================
+      # ÉCONOMIES — ce que les panneaux et la batterie évitent d'acheter
+      #
+      # Bilan instantané (W) avec les conventions de l'EMS :
+      #   G = channel_1 (+ import), P = deye_microinverter_power (tout le PV),
+      #   B = deye_battery_power (+ décharge)
+      #   conso   = max(G + P + B, 0)          maison + voiture, pertes Deye incluses
+      #   solaire = min(P, conso)              le PV sert la conso en premier
+      #   batt    = conso − import − solaire   le reste non acheté vient de la batterie
+      # Chaque terme est valorisé au tarif HC/HP de l'instant.
+      #
+      #   - Le solaire qui CHARGE la batterie n'est pas compté côté solaire :
+      #     il l'est à la décharge, côté batterie. Pas de double compte.
+      #   - Batterie chargée depuis le réseau : `batt` devient négatif et
+      #     retranche ce coût. L'économie batterie est donc un gain NET.
+      #   - Batterie qui se vide pendant un export : le solaire est servi en
+      #     premier, donc la décharge exportée ne compte pas comme économie.
+      #   - Export valorisé 0 € (même règle que ci-dessus).
+      #   - Voiture : le remboursement Octopus existe avec ou sans soleil, il
+      #     s'annule dans la différence. Un kWh solaire dans la voiture vaut
+      #     donc le tarif plein, comme dans la maison.
+      #
+      # Chaîne (helpers UI, créés par config flow REST le 26/09) :
+      #   économie_{solaire,batterie}_live (€/h)
+      #     → integration « left », max_sub_interval 1 min → *_cumul (€)
+      #     → economie_totale_cumul = somme des deux (template)
+      #     → utility_meter : economie_solaire_jour, economie_batterie_jour (daily)
+      #                       economie_solaire_mois, economie_batterie_mois (monthly)
+      #                       economie_solaire_batterie_mois (monthly)
+      #                       economie_{solaire,batterie,solaire_batterie}_annee (yearly)
+      #
+      # Coût sans panneaux ni batterie = coût réel + économies (helpers UI, 26/09) :
+      #   jour/mois : cout_energie_{jour,mois} + economie_*  (templates)
+      #   année     : cout_energie_live → integration cout_energie_cumul
+      #               → utility_meter yearly cout_energie_variable_annee
+      #               → cout_energie_annee = variable + abo × jour de l’année
+      #               → cout_sans_panneaux_ni_batterie_annee = cout_energie_annee + economie_solaire_batterie_annee
+      #                 − rachat_surplus_annee (idem jour/mois/vie : coût sans = facture + économies − rachat)
+      #   vie       : utility_meter cycle none sur les cumuls ; cout_energie_vie = integration de
+      #               cout_energie_live + abonnement/24 (template « Coût énergie live avec abonnement »)
+      #   rachat    : rachat_surplus_live → cumul → rachat_surplus_{jour,mois,annee,vie}
+      #   amortir   : reste_a_amortir_{installation,batterie} = 10384,77 / 3002 − économies vie,
+      #               rentabilite_{installation,batterie} = date estimée (device_class date)
+      #   Compteurs en net_consumption: true + periodically_resetting: false,
+      #   sinon une recharge réseau (delta négatif) serait prise pour un reset.
+      # =====================================================================
+
+      # MAJ 26/09 (§14.p du mémo) : grille hybride (import Shelly, export Deye — le Shelly
+      # invente ~50 W d'injection la nuit depuis le Deye), veille des micros ignorée (≤ 15 W),
+      # rachat Urban Solar « boost » au prix input_number.prix_rachat_surplus. Le solaire
+      # stocké est valorisé au prix de rachat côté panneaux et retranché côté batterie.
+      - name: "Économie solaire live"
+        unique_id: economie_solaire_live
+        unit_of_measurement: "€/h"
+        state_class: measurement
+        state: >
+          {% set gs = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
+          {% set gd = states('sensor.deye_grid_power') | float(0) %}
+          {% set g = gs if gs > 0 else (gd if gd < 0 else 0) %}
+          {% set p = states('sensor.deye_microinverter_power') | float(0) %}
+          {% set p = p if p > 15 else 0 %}
+          {% set b = states('sensor.deye_battery_power') | float(0) %}
+          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set pi = states('input_number.prix_rachat_surplus') | float(0) %}
+          {% set conso = [g + p + b, 0] | max %}
+          {% set solaire = [p, conso] | min %}
+          {% set stocke = [[0 - b, 0] | max, [p - solaire, 0] | max] | min %}
+          {% set export = [0 - g, 0] | max %}
+          {{ ((solaire * tarif + (export + stocke) * pi) / 1000) | round(4) }}
+
+      - name: "Économie batterie live"
+        unique_id: economie_batterie_live
+        unit_of_measurement: "€/h"
+        state_class: measurement
+        state: >
+          {% set gs = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
+          {% set gd = states('sensor.deye_grid_power') | float(0) %}
+          {% set g = gs if gs > 0 else (gd if gd < 0 else 0) %}
+          {% set p = states('sensor.deye_microinverter_power') | float(0) %}
+          {% set p = p if p > 15 else 0 %}
+          {% set b = states('sensor.deye_battery_power') | float(0) %}
+          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set pi = states('input_number.prix_rachat_surplus') | float(0) %}
+          {% set conso = [g + p + b, 0] | max %}
+          {% set solaire = [p, conso] | min %}
+          {% set stocke = [[0 - b, 0] | max, [p - solaire, 0] | max] | min %}
+          {% set export = [0 - g, 0] | max %}
+          {{ (((conso - ([g, 0] | max) - solaire) * tarif - stocke * pi) / 1000) | round(4) }}
+
+      # Méthode Urban Solar : montant = kWh injectés × prix du mois (indice CRE × coefficient USE)
+      - name: "Rachat surplus live"
+        unique_id: rachat_surplus_live
+        unit_of_measurement: "€/h"
+        state_class: measurement
+        state: >
+          {% set gs = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
+          {% set gd = states('sensor.deye_grid_power') | float(0) %}
+          {% set g = gs if gs > 0 else (gd if gd < 0 else 0) %}
+          {% set p = states('sensor.deye_microinverter_power') | float(0) %}
+          {% set p = p if p > 15 else 0 %}
+          {% set b = states('sensor.deye_battery_power') | float(0) %}
+          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set pi = states('input_number.prix_rachat_surplus') | float(0) %}
+          {% set conso = [g + p + b, 0] | max %}
+          {% set solaire = [p, conso] | min %}
+          {% set stocke = [[0 - b, 0] | max, [p - solaire, 0] | max] | min %}
+          {% set export = [0 - g, 0] | max %}
+          {{ (export * pi / 1000) | round(4) }}
+
+      - name: "Économie totale cumul"
+        unique_id: economie_totale_cumul
+        unit_of_measurement: "€"
+        device_class: monetary
+        state_class: total
+        state: >
+          {{ (states('sensor.economie_solaire_cumul') | float(0)
+              + states('sensor.economie_batterie_cumul') | float(0)) | round(4) }}

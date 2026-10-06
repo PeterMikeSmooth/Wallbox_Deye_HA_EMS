@@ -1,0 +1,14 @@
+[Unit]
+Description=Guette les debranchements pour relever Octopus
+
+[Timer]
+# Octopus comptabilise une charge ~15 min apres le debranchement. On sonde
+# toutes les 5 min : le script ne declenche un releve que si le debranchement
+# a plus de 15 min et n'a pas deja ete traite. Environ 5 releves par jour.
+OnCalendar=*:0/5
+OnBootSec=4min
+Persistent=false
+Unit=octopus-archive-debranche.service
+
+[Install]
+WantedBy=timers.target
