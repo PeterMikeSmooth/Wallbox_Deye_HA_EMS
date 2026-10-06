@@ -75,7 +75,7 @@ class WallboxCurrent:
         """Check the last BLE write once it has had time to land.
 
         Called every fast tick so that a lost write is caught ~20 s later even
-        when no other write follows (MANUAL mode writes once, then hands off).
+        when no other write follows (FULL_SPEED writes 32 A once, then hands off).
 
         A first mismatch is re-sent over BLE, not blamed on the gateway: the
         charger resets its own current to 32 A at every unplug (5 unplugs out

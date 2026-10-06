@@ -75,7 +75,7 @@ Two recurring missions run under every mode:
 
 | Entity | Description | Suggested range | Default |
 |--------|-------------|-----------------|---------|
-| `input_select.ems_mode` | Active mode (see [Modes](#modes--states)) | 6 options | `SOLAR_ONLY` |
+| `input_select.ems_mode` | Active mode (see [Modes](#modes--states)) | 4 options | `SOLAR_ONLY` |
 | `input_number.batt_charge_limit` | Max SOC the battery is allowed to charge to | 50 – 100 % | 80 % |
 | `input_number.batt_charge_prio` | SOC target reached before solar surplus goes to the EV | 0 – 100 % | auto |
 | `input_number.discharge_limit` | SOC floor — battery won't discharge for the EV below this | 20 – 100 % | auto |
@@ -181,7 +181,6 @@ The user picks a **mode** via `input_select.ems_mode`. The script maps `(mode, s
 | **SOLAR_BOOSTED** | Solar surplus + a grid share (50 % off-peak / 60 % peak) feed the EV; battery never discharges for the EV. |
 | **FULL_SPEED** | Wallbox at 32 A; the grid pays a fixed share of the EV (60 % peak / 50 % off-peak) and the battery the rest, as long as SOC is above `discharge_limit`. |
 | **STORAGE_ONLY** | Battery + solar feed the EV with `grid = 0`; wallbox current computed from available discharge power. |
-| **MANUAL** | User sets the wallbox current from the app; EMS only manages the battery. |
 
 ### Internal States (`State` enum)
 
@@ -194,7 +193,6 @@ The user picks a **mode** via `input_select.ems_mode`. The script maps `(mode, s
 | **SOLAR_ONLY** | Surplus steering, grid target = 0 %. |
 | **SOLAR_BOOSTED** | Surplus steering, grid target = share of EV power. |
 | **STORAGE_ONLY** | Battery+solar → EV, grid = 0. |
-| **MANUAL** | User-controlled wallbox; EMS manages battery only. |
 
 **SOC protection:** if `SOC ≤ discharge_limit`, `STORAGE_ONLY` (no grid) switches to `SOLAR_ONLY` and the `ems_mode` helper is rewritten so the dashboard reflects it. The switch sticks: the EMS does not go back to `STORAGE_ONLY` when the SOC recovers. `FULL_SPEED` handles the floor itself (see [FULL_SPEED](#full_speed-mode)).
 
@@ -212,7 +210,6 @@ ev_power ≤ EV_CHARGING_DETECT_W (40 W) ?
   └─ no  → dispatch on ems_mode:
 
      FULL_SPEED  → FULL_SPEED   (also the legacy STORAGE_BOOSTED)
-     MANUAL      → MANUAL
 
      STORAGE_ONLY
         SOC ≤ discharge_limit ? → protection, ems_mode rewritten to SOLAR_ONLY
@@ -279,13 +276,6 @@ The `100 W` solar threshold (`SOLAR_AVAILABLE_W`) naturally separates "day" from
 - **Trigger**: `ems_mode = STORAGE_ONLY` AND `SOC > discharge_limit`
 - **Slow loop (60 s)**: wallbox current is **computed directly** as `(MAX_DISCHARGE_POWER_W + solar − house_load) / grid_voltage`, clamped 6–32 A. The incremental steering can't be used here because the Deye keeps `grid ≈ 0` on its own regardless of wallbox current.
 - **SOC floor**: at `SOC ≤ discharge_limit` the mode switches to `SOLAR_ONLY`.
-
-### MANUAL Mode (user drives the wallbox)
-
-- **Trigger**: `ems_mode = MANUAL`
-- **Wallbox**: started at 6 A on entry, then **never touched again** — the user sets the current from the app. On leaving MANUAL the wallbox is reset to 6 A.
-- **Battery**: discharges normally (100 A, `MAX_DISCHARGE_POWER_W` cap) while `SOC > discharge_limit`. Below the floor (hysteresis +2 %) the EMS **hands off** the Deye discharge current entirely so the user can set it manually in HA.
-- Wallbox override detection is disabled in MANUAL (a higher `ev_power` is intended, not a cloud override to fight).
 
 ---
 
@@ -459,7 +449,7 @@ desired_A = clamp(desired_A, 0, 100)
 - `DISCHARGE_MARGIN_A`: +1 A safety margin to avoid oscillation.
 - EMA smoothing: `smoothed = α·new + (1−α)·prev` with `α = EMA_ALPHA (0.3)`.
 - Computed every second, written **only when the rounded integer changes**.
-- Used in `EV_NO_SOLAR`, in the house-only branch of `FULL_SPEED`, and in the SOC-floor branches of `STORAGE_ONLY` / `MANUAL`.
+- Used in `EV_NO_SOLAR` and in the house-only branch of `FULL_SPEED`.
 
 ### Surplus Steering Algorithm
 
@@ -507,7 +497,7 @@ This keeps enough charge for the following night without over-charging.
 
 ### Wallbox Override Protection
 
-The Pulsar's cloud integration sometimes ignores our setpoint. If `ev_power` exceeds the expected `setpoint × grid_voltage` by more than 1500 W for 30 s, the script toggles `setpoint+1 → setpoint` to force a cloud refresh, and logs the event. Disabled in `MANUAL`.
+The Pulsar's cloud integration sometimes ignores our setpoint. If `ev_power` exceeds the expected `setpoint × grid_voltage` by more than 1500 W for 30 s, the script toggles `setpoint+1 → setpoint` to force a cloud refresh, and logs the event.
 
 ---
 
@@ -602,7 +592,7 @@ nano config.py      # Fill in HA IP + token
 
 # In Home Assistant, create the helpers:
 #   input_select.ems_mode  → options: SOLAR_ONLY, SOLAR_BOOSTED, FULL_SPEED,
-#                            STORAGE_ONLY, MANUAL
+#                            STORAGE_ONLY
 #   input_number.batt_charge_limit   (50–100 %, step 5, default 80)
 #   input_number.batt_charge_prio    (0–100 %)
 #   input_number.discharge_limit     (20–100 %)
