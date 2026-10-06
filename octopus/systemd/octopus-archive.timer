@@ -2,7 +2,11 @@
 Description=Releve quotidien de l'archive Octopus
 
 [Timer]
-OnCalendar=*-*-* 05:00:00
+# 07:30 et non 05:00 : a 5h la voiture est encore branchee 30 % du temps et la
+# charge de la nuit n'est pas encore comptabilisee par Octopus (~15 min apres
+# le debranchement, vers 6h30). Mesure sur 10 jours : 7h-8h est le creneau ou
+# aucune voiture n'est branchee 85 % du temps.
+OnCalendar=*-*-* 07:30:00
 # Etale la charge si plusieurs machines tapent l'API au meme moment
 RandomizedDelaySec=15m
 # Rattrape le releve si le Pi etait eteint a l'heure prevue
