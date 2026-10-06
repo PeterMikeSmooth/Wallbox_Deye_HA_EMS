@@ -2,10 +2,10 @@
 
 State machine with states:
   IDLE, FULL_SPEED, EV_NO_SOLAR, BATTERY_PRIORITY,
-  SOLAR_ONLY, SOLAR_BOOSTED, STORAGE_BOOSTED, STORAGE_ONLY, MANUAL.
+  SOLAR_ONLY, SOLAR_BOOSTED, STORAGE_ONLY, MANUAL.
 
 Modes (input_select.ems_mode):
-  SOLAR_ONLY, SOLAR_BOOSTED, FULL_SPEED, STORAGE_BOOSTED, STORAGE_ONLY, MANUAL.
+  SOLAR_ONLY, SOLAR_BOOSTED, FULL_SPEED, STORAGE_ONLY, MANUAL.
 
 See README.md for full specification.
 """
@@ -129,12 +129,11 @@ IONIQ_LATE_POLL_S = 60           # HA automation that refreshes the car anyway
 
 class State(enum.Enum):
     IDLE = "IDLE"                        # Internal: no EV charging detected
-    FULL_SPEED = "FULL_SPEED"            # Mode: wallbox 32A, battery covers house
+    FULL_SPEED = "FULL_SPEED"            # Mode: wallbox 32A, grid pays 50-60% of EV, battery the rest
     EV_NO_SOLAR = "EV_NO_SOLAR"          # Internal: no solar, wallbox 6A, discharge limited to house
     BATTERY_PRIORITY = "BATTERY_PRIORITY"  # Internal: solar present but SOC < priority
     SOLAR_ONLY = "SOLAR_ONLY"            # Mode: solar surplus → wallbox, grid ≈ 0
     SOLAR_BOOSTED = "SOLAR_BOOSTED"      # Mode: wallbox boosted, grid pays 50-60% of EV
-    STORAGE_BOOSTED = "STORAGE_BOOSTED"  # Mode: battery discharge + grid pays 50-60%
     STORAGE_ONLY = "STORAGE_ONLY"        # Mode: battery + solar → wallbox, grid = 0
     MANUAL = "MANUAL"                    # Mode: user sets wallbox current; EMS only manages battery
 
@@ -312,13 +311,6 @@ class EMS:
         self._last_slow_tick = 0.0  # force immediate first wallbox adjustment
 
 
-    def _enter_storage_boosted(self) -> None:
-        log.info("→ STORAGE_BOOSTED")
-        self.state = State.STORAGE_BOOSTED
-        self._ema_discharge = None
-        self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
-        self._last_slow_tick = time.monotonic()
-
     def _enter_storage_only(self) -> None:
         log.info("→ STORAGE_ONLY")
         self.state = State.STORAGE_ONLY
@@ -478,8 +470,8 @@ class EMS:
         target = current + delta
         return int(clamp(target, config.WALLBOX_MIN_CURRENT_A, config.WALLBOX_MAX_CURRENT_A))
 
-    def _compute_storage_discharge(self, s: dict, grid_ratio: float) -> int:
-        """Discharge algorithm for STORAGE_BOOSTED / STORAGE_ONLY.
+    def _compute_full_speed_discharge(self, s: dict, grid_ratio: float) -> int:
+        """Discharge algorithm for FULL_SPEED above discharge_limit.
 
         Targets grid = grid_ratio × ev_power.
         At equilibrium: discharge ≈ (1 - grid_ratio) × ev + house - solar.
@@ -1201,34 +1193,26 @@ class EMS:
 
     # -- state evaluation -----------------------------------------------------
 
-    def _leave_storage_on_low_soc(self, s: dict, mode: str) -> State:
-        """SOC floor reached in a storage mode: switch to its grid cousin.
+    def _leave_storage_on_low_soc(self, s: dict) -> State:
+        """SOC floor reached in STORAGE_ONLY: fall back to SOLAR_ONLY.
 
-        The two storage modes differ by whether the grid may feed the car,
-        and each falls back to the mode that keeps that promise:
+        STORAGE_ONLY promises nothing from the grid, and SOLAR_ONLY keeps that
+        promise once the battery is spent.  The helper is rewritten so the
+        dashboard shows it, and the choice sticks: the EMS does not return to
+        STORAGE_ONLY when the SOC recovers.  This overrides what the user
+        picked, so it targets SOLAR_ONLY literally rather than
+        ``DEFAULT_EMS_MODE``: it is a battery protection, not the end of a
+        session like :meth:`_reset_mode_on_unplug`.
 
-        - STORAGE_BOOSTED (battery + grid) → FULL_SPEED (grid; below
-          discharge_limit the battery only covers the house, see FULL_SPEED);
-        - STORAGE_ONLY (no grid) → SOLAR_ONLY.
-
-        The helper is rewritten so the dashboard shows it, and the choice
-        sticks: the EMS does not return to the storage mode when the SOC
-        recovers.  This overrides what the user picked, so it targets the
-        cousin literally rather than ``DEFAULT_EMS_MODE``: it is a battery
-        protection, not the end of a session like
-        :meth:`_reset_mode_on_unplug`.
+        (FULL_SPEED needs no such switch: it handles the floor itself.)
         """
-        if mode == "STORAGE_BOOSTED":
-            new_mode, state = "FULL_SPEED", State.FULL_SPEED
-        elif s["solar_power"] > config.SOLAR_AVAILABLE_W:
-            new_mode, state = "SOLAR_ONLY", State.SOLAR_ONLY
-        else:
-            new_mode, state = "SOLAR_ONLY", State.EV_NO_SOLAR
-        self.ha.set_ems_mode(new_mode)
-        s["ems_mode"] = new_mode
-        log.info("SOC %.0f%% <= discharge_limit %.0f%% — %s → %s",
-                 s["battery_soc"], s["discharge_limit"], mode, new_mode)
-        return state
+        self.ha.set_ems_mode("SOLAR_ONLY")
+        s["ems_mode"] = "SOLAR_ONLY"
+        log.info("SOC %.0f%% <= discharge_limit %.0f%% — STORAGE_ONLY → SOLAR_ONLY",
+                 s["battery_soc"], s["discharge_limit"])
+        if s["solar_power"] > config.SOLAR_AVAILABLE_W:
+            return State.SOLAR_ONLY
+        return State.EV_NO_SOLAR
 
     def _determine_target_state(self, s: dict) -> State:
         """Determine the target state based on current sensor readings."""
@@ -1239,16 +1223,18 @@ class EMS:
 
         mode = s.get("ems_mode", "SOLAR_ONLY").upper()
 
-        if mode == "FULL_SPEED":
+        # STORAGE_BOOSTED was merged into FULL_SPEED on 2026-10-06; a helper
+        # still offering the old option must not fall through to SOLAR_ONLY.
+        if mode in ("FULL_SPEED", "STORAGE_BOOSTED"):
             return State.FULL_SPEED
 
         if mode == "MANUAL":
             return State.MANUAL
 
-        if mode in ("STORAGE_BOOSTED", "STORAGE_ONLY"):
+        if mode == "STORAGE_ONLY":
             if s["battery_soc"] <= s["discharge_limit"]:
-                return self._leave_storage_on_low_soc(s, mode)
-            return State.STORAGE_BOOSTED if mode == "STORAGE_BOOSTED" else State.STORAGE_ONLY
+                return self._leave_storage_on_low_soc(s)
+            return State.STORAGE_ONLY
 
         # SOLAR_ONLY / SOLAR_BOOSTED share routing
         solar_available = s["solar_power"] > config.SOLAR_AVAILABLE_W
@@ -1298,8 +1284,6 @@ class EMS:
             self._enter_solar_only()
         elif target == State.SOLAR_BOOSTED:
             self._enter_solar_boosted()
-        elif target == State.STORAGE_BOOSTED:
-            self._enter_storage_boosted()
         elif target == State.STORAGE_ONLY:
             self._enter_storage_only()
         elif target == State.MANUAL:
@@ -1383,8 +1367,15 @@ class EMS:
 
         elif self.state == State.FULL_SPEED:
             if s["battery_soc"] > s["discharge_limit"]:
-                # Above discharge_limit: battery at max (4.6kW cap) for EV + house
-                self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
+                # Above discharge_limit: the battery is dosed so the grid pays a
+                # fixed share of the car (BOOSTED_GRID_RATIO_*: 60 % peak, 50 %
+                # off-peak); the battery covers the rest plus the house, less
+                # the sun.  This was STORAGE_BOOSTED, merged here on 2026-10-06
+                # — until then FULL_SPEED emptied the battery at 4.6 kW first.
+                off_peak = is_off_peak()
+                grid_ratio = config.BOOSTED_GRID_RATIO_OFF_PEAK if off_peak else config.BOOSTED_GRID_RATIO_PEAK
+                amps = self._compute_full_speed_discharge(s, grid_ratio)
+                self._set_max_discharging(amps)
             elif s["solar_power"] > config.SOLAR_AVAILABLE_W:
                 # At or below discharge_limit but solar available: don't discharge —
                 # the solar production covers the house instead of the battery.
@@ -1423,19 +1414,6 @@ class EMS:
                     s["grid_power"], s["battery_power"], s["ev_power"],
                     grid_ratio * 100, "OFF-PEAK" if off_peak else "PEAK", amps,
                 )
-
-        elif self.state == State.STORAGE_BOOSTED:
-            # No SOC floor here: _determine_target_state leaves the mode for
-            # FULL_SPEED as soon as SOC <= discharge_limit.
-            off_peak = is_off_peak()
-            grid_ratio = config.BOOSTED_GRID_RATIO_OFF_PEAK if off_peak else config.BOOSTED_GRID_RATIO_PEAK
-            amps = self._compute_storage_discharge(s, grid_ratio)
-            self._set_max_discharging(amps)
-            # Re-send wallbox 32A periodically (cloud may override)
-            now = time.monotonic()
-            if now - self._last_slow_tick >= config.SLOW_LOOP_INTERVAL_S:
-                self._last_slow_tick = now
-                self._set_wallbox(config.WALLBOX_MAX_CURRENT_A)
 
         elif self.state == State.STORAGE_ONLY:
             # No SOC floor here: _determine_target_state leaves the mode for

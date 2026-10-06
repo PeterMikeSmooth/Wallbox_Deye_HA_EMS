@@ -26,7 +26,7 @@ OFF_PEAK_WINDOWS = [
     ((12, 24), (15, 24)),
 ]
 
-# SOLAR_BOOSTED and STORAGE_BOOSTED: share of EV power imported from grid
+# SOLAR_BOOSTED, and FULL_SPEED above discharge_limit: share of EV power imported from grid
 BOOSTED_GRID_RATIO_OFF_PEAK = 0.50  # Off-peak: grid 50%, solar 50%
 BOOSTED_GRID_RATIO_PEAK = 0.60      # Peak: grid 60%, solar 40%
 

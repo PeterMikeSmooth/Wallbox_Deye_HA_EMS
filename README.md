@@ -121,7 +121,7 @@ All sensor reads and actuator writes go through the **Home Assistant REST API** 
 ### Control Loops
 
 - **Fast loop (~1 s)**: read all sensors → detect car plug-in → evaluate the state machine → apply per-state continuous work (battery discharge limits, override detection, overnight tracking). Writes to HA **only when a value changes** to avoid hammering the Modbus bus.
-- **Slow loop (~60 s)**: wallbox current steering in the surplus/storage modes (`SOLAR_ONLY`, `SOLAR_BOOSTED`, `STORAGE_ONLY`, and the periodic 32 A refresh in `STORAGE_BOOSTED`). Implemented as a monotonic-clock gate inside the fast loop.
+- **Slow loop (~60 s)**: wallbox current steering in the surplus/storage modes (`SOLAR_ONLY`, `SOLAR_BOOSTED`, `STORAGE_ONLY`). Implemented as a monotonic-clock gate inside the fast loop.
 
 ### Car unplug reset
 
@@ -179,8 +179,7 @@ The user picks a **mode** via `input_select.ems_mode`. The script maps `(mode, s
 |------|--------|
 | **SOLAR_ONLY** | Only solar surplus feeds the EV; keep `grid ≈ 0`. |
 | **SOLAR_BOOSTED** | Solar surplus + a grid share (50 % off-peak / 60 % peak) feed the EV; battery never discharges for the EV. |
-| **FULL_SPEED** | Wallbox at 32 A; battery backs the EV+house as long as SOC is above `discharge_limit`. |
-| **STORAGE_BOOSTED** | Wallbox at 32 A; battery discharges to cover a target share of EV power (grid pays the rest). |
+| **FULL_SPEED** | Wallbox at 32 A; the grid pays a fixed share of the EV (60 % peak / 50 % off-peak) and the battery the rest, as long as SOC is above `discharge_limit`. |
 | **STORAGE_ONLY** | Battery + solar feed the EV with `grid = 0`; wallbox current computed from available discharge power. |
 | **MANUAL** | User sets the wallbox current from the app; EMS only manages the battery. |
 
@@ -194,11 +193,12 @@ The user picks a **mode** via `input_select.ems_mode`. The script maps `(mode, s
 | **FULL_SPEED** | Mode state — see [detailed logic](#full_speed-mode). |
 | **SOLAR_ONLY** | Surplus steering, grid target = 0 %. |
 | **SOLAR_BOOSTED** | Surplus steering, grid target = share of EV power. |
-| **STORAGE_BOOSTED** | Battery-share discharge steering. |
 | **STORAGE_ONLY** | Battery+solar → EV, grid = 0. |
 | **MANUAL** | User-controlled wallbox; EMS manages battery only. |
 
-**SOC protection (storage modes):** if `SOC ≤ discharge_limit`, each storage mode switches to its grid cousin and the `ems_mode` helper is rewritten so the dashboard reflects it. `STORAGE_BOOSTED` (battery + grid) → `FULL_SPEED` (grid). `STORAGE_ONLY` (no grid) → `SOLAR_ONLY`. The switch sticks: the EMS does not go back to the storage mode when the SOC recovers.
+**SOC protection:** if `SOC ≤ discharge_limit`, `STORAGE_ONLY` (no grid) switches to `SOLAR_ONLY` and the `ems_mode` helper is rewritten so the dashboard reflects it. The switch sticks: the EMS does not go back to `STORAGE_ONLY` when the SOC recovers. `FULL_SPEED` handles the floor itself (see [FULL_SPEED](#full_speed-mode)).
+
+`STORAGE_BOOSTED` was merged into `FULL_SPEED` on 2026-10-06; an `ems_mode` still set to it is treated as `FULL_SPEED`.
 
 ---
 
@@ -211,15 +211,13 @@ ev_power ≤ EV_CHARGING_DETECT_W (40 W) ?
   └─ yes → IDLE
   └─ no  → dispatch on ems_mode:
 
-     FULL_SPEED  → FULL_SPEED
+     FULL_SPEED  → FULL_SPEED   (also the legacy STORAGE_BOOSTED)
      MANUAL      → MANUAL
 
-     STORAGE_BOOSTED / STORAGE_ONLY
-        SOC ≤ discharge_limit ? → protection, ems_mode rewritten:
-                                   STORAGE_BOOSTED → FULL_SPEED
-                                   STORAGE_ONLY    → SOLAR_ONLY
-                                     (SOLAR_ONLY if solar > 100 W else EV_NO_SOLAR)
-        else                    → STORAGE_BOOSTED / STORAGE_ONLY
+     STORAGE_ONLY
+        SOC ≤ discharge_limit ? → protection, ems_mode rewritten to SOLAR_ONLY
+                                   → SOLAR_ONLY if solar > 100 W else EV_NO_SOLAR
+        else                    → STORAGE_ONLY
 
      SOLAR_ONLY / SOLAR_BOOSTED
         solar ≤ 100 W ?         → EV_NO_SOLAR
@@ -240,12 +238,12 @@ The `100 W` solar threshold (`SOLAR_AVAILABLE_W`) naturally separates "day" from
 - **Entry actions**: `max_discharging_current` → 100 A, `wallbox_current` → 6 A
 - The Deye runs its own balancing algorithm; the script does not intervene beyond resetting safe defaults.
 
-### FULL_SPEED Mode (wallbox at max, battery backs the EV)
+### FULL_SPEED Mode (wallbox at max, grid and battery share the EV)
 
 - **Trigger**: `ems_mode = FULL_SPEED` (while EV charging)
 - **Entry actions**: `wallbox_current` → 32 A, then **hands off** — the user may lower it manually and the value sticks.
 - **Battery discharge policy** (evaluated every fast loop), based on SOC vs `discharge_limit`:
-  - **SOC > `discharge_limit`** → `max_discharging_current` = 100 A (capped by `MAX_DISCHARGE_POWER_W`). The battery discharges freely to help power both the EV and the house.
+  - **SOC > `discharge_limit`** → the battery is **dosed** by the [FULL_SPEED Discharge Algorithm](#full_speed-discharge-algorithm) so that `grid = grid_ratio × ev_power` (`BOOSTED_GRID_RATIO_PEAK` 60 % / `_OFF_PEAK` 50 %). The battery covers the rest of the EV plus the house, less the sun, capped by `MAX_DISCHARGE_POWER_W`. (Until 2026-10-06 the battery discharged freely here; that dosing was the `STORAGE_BOOSTED` mode, now merged.)
   - **SOC ≤ `discharge_limit` AND solar > 100 W** → `max_discharging_current` = 0 A. The battery is spared — the **solar production covers the house** instead.
   - **SOC ≤ `discharge_limit` AND solar ≤ 100 W** → discharge throttled to **house-only** via the [Discharge Limitation Algorithm](#discharge-limitation-algorithm). The battery powers only the house; the grid covers the EV.
 
@@ -275,14 +273,6 @@ The `100 W` solar threshold (`SOLAR_AVAILABLE_W`) naturally separates "day" from
 
 - Like `SOLAR_ONLY` but the surplus steering targets a **positive grid import** = `ev_power × grid_ratio`, where `grid_ratio` is `BOOSTED_GRID_RATIO_OFF_PEAK` (50 %) or `BOOSTED_GRID_RATIO_PEAK` (60 %) depending on the [off-peak window](#configuration).
 - Battery discharge is held at **0 A** so the boost comes from grid + solar, never the battery.
-
-### STORAGE_BOOSTED State (battery discharges to cover a share of the EV)
-
-- **Trigger**: `ems_mode = STORAGE_BOOSTED` AND `SOC > discharge_limit`
-- **Entry actions**: `wallbox_current` → 32 A.
-- **Fast loop**: [Storage Discharge Algorithm](#storage-discharge-algorithm) targets `grid = grid_ratio × ev_power`, so the battery covers the complementary share.
-- **SOC floor**: at `SOC ≤ discharge_limit` the mode switches to `FULL_SPEED` (see [SOC protection](#modes--states)).
-- The wallbox 32 A setpoint is re-sent every 60 s (the cloud integration may override it).
 
 ### STORAGE_ONLY State (battery + solar → EV, grid = 0)
 
@@ -486,9 +476,9 @@ wallbox = clamp(last_wallbox + delta, 6, 32)
 - `grid_target = 0` in `SOLAR_ONLY`; `grid_target = ev_power × grid_ratio` in `SOLAR_BOOSTED`.
 - Runs once per minute. Between adjustments the battery may briefly discharge to cover a spike (normal Deye behavior).
 
-### Storage Discharge Algorithm
+### FULL_SPEED Discharge Algorithm
 
-**Goal** (`STORAGE_BOOSTED`): discharge the battery so that `grid = grid_ratio × ev_power`.
+**Goal** (`FULL_SPEED`, SOC above `discharge_limit`): discharge the battery so that `grid = grid_ratio × ev_power`.
 
 ```
 target_power = battery_power + grid_power − grid_ratio × ev_power
@@ -573,7 +563,7 @@ OFF_PEAK_WINDOWS = [
     ((12, 24), (15, 24)),
 ]
 
-# Grid share when boosting (SOLAR_BOOSTED and STORAGE_BOOSTED)
+# Grid share of the EV (SOLAR_BOOSTED, and FULL_SPEED above discharge_limit)
 BOOSTED_GRID_RATIO_OFF_PEAK = 0.50   # Off-peak: grid 50 %, solar 50 %
 BOOSTED_GRID_RATIO_PEAK = 0.60       # Peak: grid 60 %, solar 40 %
 
@@ -612,7 +602,7 @@ nano config.py      # Fill in HA IP + token
 
 # In Home Assistant, create the helpers:
 #   input_select.ems_mode  → options: SOLAR_ONLY, SOLAR_BOOSTED, FULL_SPEED,
-#                            STORAGE_BOOSTED, STORAGE_ONLY, MANUAL
+#                            STORAGE_ONLY, MANUAL
 #   input_number.batt_charge_limit   (50–100 %, step 5, default 80)
 #   input_number.batt_charge_prio    (0–100 %)
 #   input_number.discharge_limit     (20–100 %)
