@@ -129,23 +129,23 @@ When the wallbox reports the car has just been **unplugged**, `ems_mode` is rese
 
 Doing it at unplug also makes the detection latency free: the mode is only consumed by the *next* session, so a reset that lands minutes late is still correct.
 
-**Detection.** The runtime signal is `sensor.wallbox_pulsar_max_sn_429953_status_description`, whose values were classified by labelling 9 days of history with `sensor.wallbox_pulsar_max_charging_status` (`SMART_CONTROL_IN_PROGRESS` / `_CAPABLE` = plugged, `_NOT_AVAILABLE` = unplugged — a 5-minute-polled sensor used for the study only, never read at runtime):
+**Detection.** The runtime signals come from the local BLE gateway, not from the cloud `status_description`, which polls every 90 s and has frozen for 21 minutes on a car that had left. Two gateway fields, and neither is enough on its own:
 
-| Status | Plugged | Unplugged | Verdict |
-|---|---:|---:|---|
-| `Locked` | 0.1 h | 109.3 h | **unplugged** |
-| `Waiting for car demand` | 24.8 h | 0.0 h | plugged |
-| `Locked, car connected` | 20.3 h | 0.0 h | plugged |
-| `Waiting` | 19.6 h | 0.0 h | plugged |
-| `Charging` | 17.9 h | 0.0 h | plugged |
-| `Ready` | 1.0 h | 0.4 h | unplugged (see below) |
-| `Disconnected` | 0.3 h | 1.0 h | ambiguous → inconclusive |
+- `binary_sensor.wallbox_192_168_8_188_car_connected` — the firmware's own flag, derived from the charger's raw state code. Fast, but it answers "no car" for any code it does not recognise. Five days of logging the gateway every 3 s caught **six false "no car" episodes of 3 to 32 s** with a car plugged in, three of which were slow enough for HA's 10 s polling to publish.
+- `sensor.wallbox_192_168_8_188_charger_status` — a label from a separate read. In every one of those six episodes it still named a car (`Charging`, `Connected — waiting for car`, `OCPP charge finishing`).
 
-`Locked` and `Ready` demote a plugged state; `Disconnected`, `unavailable` and `Error` are transparent, leaving the remembered state alone, because those are the shapes a cloud dropout takes. Either no-car status reached from an already-unplugged state produces no edge, which is what neutralises the `Locked ↔ Ready` chatter.
+So an unplug needs the flag to say off **and** one of two witnesses to agree:
 
-The time-weighted table makes `Ready` look ambiguous, but that is the 5-minute-polled label lagging rather than the status. Replayed as edges — how it is actually used — every `Ready` reached from a plugged state was a real unplug: four with the line at 7-8 W for the next hour, three where power returned only because another car was plugged in one to two minutes later. Trusting it finds 18 unplugs over the window instead of 17, two of them 6 and 7 minutes sooner, and loses none.
+1. the label reaching `Locked` or `Ready` — it trails the flag by 0 to 19 s; or
+2. during a Tesla session, `binary_sensor.martine_charge_cable` reading `off`. That is a genuine cable sensor, not a power proxy: it held through the five charge pauses of the 09-11 night, and it led the gateway flag by 8 s on 10-07. It is read on demand, only inside the window where the flag already disagrees with the label, so the Tesla entities stay out of the 1 Hz batch.
 
-No confirmation delay is applied. The dangerous case — a car mid-charge — always shows itself through `ev_power`, and that veto already guards the reset; across all 18 edges the line read 7 W or less and the veto never fired.
+A car's own sensor is only consulted while that car is the one identified on the cable — during an Ioniq session, `martine_charge_cable` being `off` just means the Tesla is elsewhere.
+
+> `binary_sensor.moniq_obd_cable_branche` is **not** used despite its name: it follows current, not the cable. It went `off` on 10-10 at 13:59 with the Ioniq plugged in and the charge resumed nine minutes later, so it would announce a false unplug at every Octopus charging slot.
+
+**Swapping cars quickly.** Because the label can take 19 s to catch up, putting the second car on the cable inside that window leaves *both* edges unseen — and the previous car's identification and mode would carry over. The charger announces the new session itself: `charger_status` reporting `Connected — no current` appeared 20 times in five days, every one a real plug-in, always reached from `Locked`, never mid-session. That label arriving while a car is still believed connected therefore closes the session outright — mode reset, `ev_connected` cleared — and the normal plug-in edge identifies the newcomer.
+
+Measured end to end, physical unplug to `ev_connected`, with the Tesla cable sensor as the reference: **mean 17 s, worst 34 s** over 14 unplugs. Roughly 0 s for the gateway flag, 5-7 s for HA to publish it, 0-19 s waiting for a witness, 2 s of EMS loop.
 
 > **`ev_power` can only veto, never confirm.** A car sitting plugged and idle draws the same ~6 W standby as an empty cable, so no power does *not* mean no car. The guard in `_reset_mode_on_unplug()` blocks a reset when power is flowing (proof a car is there) and nothing else; it blocked 0 of the 17 real edges. Likewise `_determine_target_state()` returning `IDLE` below 40 W means "nothing to steer", not "unplugged".
 
@@ -155,7 +155,7 @@ No confirmation delay is applied. The dangerous case — a car mid-charge — al
 
 It is written on the same edges as the mode reset: `disconnected` on unplug, and on plug-in the identification runs:
 
-1. **Tesla** — `binary_sensor.martine_charge_cable` is `on` **and** `device_tracker.martine_location` is `home`. These are HA cache reads: no request reaches Tessie and the car is never woken. The cable is used rather than the charge state because over 9 days the Tesla was plugged in at home for 70.1 h and read `stopped` for 21.0 h of those — the EMS's own solar pause produces exactly that — so keying on the charge state would have missed the car one time in three. The cable never claimed the Tesla during an Ioniq session: the only disagreements totalled 0.2 h, in four 2-4 minute bursts where it was simply quicker than the wallbox's 5-minute-polled sensor.
+1. **Tesla** — `binary_sensor.martine_charge_cable` is `on` **and** `device_tracker.martine_location` is `home`. These are HA cache reads: no request reaches Tessie and the car is never woken. The cable is used rather than the charge state because over 9 days the Tesla was plugged in at home for 70.1 h and read `stopped` for 21.0 h of those — the EMS's own solar pause produces exactly that — so keying on the charge state would have missed the car one time in three. The cable never claimed the Tesla during an Ioniq session: the only disagreements totalled 0.2 h, in four 2-4 minute bursts where it was simply quicker than the wallbox's 5-minute-polled sensor. The cable normally flips 6-36 s *before* the wallbox's `car_connected`, but on 2026-10-06 it trailed it by 4.5 s and the Tesla was published as `other connected`; so the check is polled for up to 30 s before the Ioniq is woken, and re-read once more before settling on `other connected` or `unknown`.
 2. **Ioniq** — otherwise, `kia_uvo.force_update` asks the vehicle directly, then the answer is read once `sensor.moniq_location_last_updated` has advanced. `home` + `binary_sensor.moniq_ev_battery_plug` = `on` identifies it.
 3. **Otherwise** — `other connected`. If the Ioniq never answers, the result is `unknown`, which is not the same claim as "some other car".
 
