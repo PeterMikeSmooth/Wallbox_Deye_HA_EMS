@@ -121,6 +121,12 @@ EV_UNKNOWN = "unknown"           # the Ioniq could not be reached — not "not t
 # than the unplug takes to confirm.
 GW_NEW_SESSION = "Connected — no current"
 
+# How often the Tesla's own cable sensor is polled while it is the car on the
+# cable.  It is the only witness that can beat the gateway, which since the
+# 2026-10-11 firmware fix waits for its two fields to agree and so takes ~15 s
+# to drop the flag (measured 20:48:41 unplug -> 20:48:56 flag).
+TESLA_CABLE_POLL_S = 3
+
 TESLA_CABLE_GRACE_S = 30         # Tessie's cable usually beats the wallbox by
 TESLA_CABLE_POLL_S = 3           # 6-36 s, but trailed it by 4.5 s on 2026-10-06
 IONIQ_REFRESH_TIMEOUT_S = 60     # wait for the payload after force_update returns
@@ -224,6 +230,8 @@ class EMS:
         self._last_gw_status = None         # last logged gateway charger_status
         self._plug_seen = None              # plug change read once, awaiting confirmation
         self._ev_label = None               # last value published to ev_connected
+        self._tesla_cable_ts = 0.0          # monotonic ts of the last cable poll
+        self._tesla_cable_off = False       # last cable reading, cached between polls
         self._last_written_grid_ratio = None
         self._battery_voltage = 52.0        # last known battery voltage
         # Wallbox override detection
@@ -1182,22 +1190,35 @@ class EMS:
     def _tesla_cable_says_unplugged(self) -> bool:
         """Does the Tesla itself report its cable out?
 
-        A second witness for the unplug, consulted only in the window where
-        the gateway flag already says off and its label has not caught up —
-        the label trails the flag by 0 to 19 s.  The Tesla's own cable sensor
-        is often ahead of both (8 s ahead of the flag on 2026-10-07 21:12),
-        and unlike anything power-based it does not follow the charge: it held
-        through five charge pauses on the night of 09-11.
+        Asked independently of the gateway, because the gateway can no longer
+        be beaten from behind: since the 2026-10-11 firmware fix its flag
+        waits for st and the label to agree, so the window this used to key on
+        — flag off while the label still named a car — no longer exists.  On
+        the 20:48:41 unplug that night the flag only dropped at 20:48:56 and
+        ev_connected followed at 20:49:04, 23 s after the cable.
 
-        Deliberately not in the 1 Hz batch: read only for the handful of ticks
-        that window lasts.  An HA state read never reaches Tessie anyway
+        The cable sensor is a genuine cable sensor, not a power proxy: it held
+        through the five charge pauses of the 09-11 night, where anything
+        current-based (the Shelly, the Ioniq's OBD dongle) would have reported
+        an unplug at each one.
+
+        Polled every TESLA_CABLE_POLL_S rather than every tick, and only while
+        the Tesla is the car on the cable, so the Tesla entities stay out of
+        the 1 Hz batch as agreed.  An HA state read never reaches Tessie
         (verified 2026-09-11, 200 reads in 2 s moved no last_updated).
         """
-        try:
-            return ha_text(self.ha.read_tesla_state(), "tesla_charge_cable") == "off"
-        except Exception:
-            log.warning("Could not read the Tesla cable sensor", exc_info=True)
-            return False
+        now = time.monotonic()
+        if now - self._tesla_cable_ts >= TESLA_CABLE_POLL_S:
+            self._tesla_cable_ts = now
+            try:
+                self._tesla_cable_off = self.ha.read_tesla_cable() == "off"
+            except Exception:
+                log.warning("Could not read the Tesla cable sensor", exc_info=True)
+                self._tesla_cable_off = False
+        # The answer is cached between polls, not withheld: an edge has to be
+        # read on two consecutive ticks, so returning False while throttled
+        # would mean the witness never got confirmed and never concluded.
+        return self._tesla_cable_off
 
     def _reset_mode_for_new_session(self, s: dict) -> None:
         """Hand a new session the default mode, no questions asked.
@@ -1381,15 +1402,14 @@ class EMS:
             self._plug_seen = None
 
         plugged = self._car_plugged(s)
-        # Tesla session: take the car's own word rather than waiting for the
-        # gateway label.  Only while we still believe a car is on the cable
-        # and the flag already disagrees — see _tesla_cable_says_unplugged().
+        # Tesla session: take the car's own word, without waiting for the
+        # gateway to make up its mind — see _tesla_cable_says_unplugged().
         if (plugged is True and self._car_connected is True
-                and s.get("gw_car_connected") == "off"
                 and self._ev_label == EV_TESLA
                 and self._tesla_cable_says_unplugged()):
-            log.info("Tesla reports its cable out — unplug confirmed without "
-                     "waiting for the gateway label (%r)", gw_status)
+            log.info("Tesla reports its cable out — unplug confirmed ahead of "
+                     "the gateway (flag=%r label=%r)",
+                     s.get("gw_car_connected"), gw_status)
             plugged = False
         # A change must be read on two ticks in a row.  HA publishes
         # car_connected and charger_status one after the other, and our two
@@ -1424,6 +1444,12 @@ class EMS:
                     self._identify_plugged_car()
                 else:
                     self._write_ev_connected(EV_NONE)
+            if plugged != self._car_connected:
+                # A new session must not inherit the previous one's cable
+                # reading: a stale "off" would fire the moment the Tesla is
+                # identified again.
+                self._tesla_cable_ts = 0.0
+                self._tesla_cable_off = False
             self._car_connected = plugged
 
         # 1. Evaluate state machine

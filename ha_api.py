@@ -163,6 +163,16 @@ class HomeAssistantAPI:
             "ioniq_data_ts": self.get_text_state_safe(IONIQ_DATA_TS),
         }
 
+    def read_tesla_cable(self) -> str | None:
+        """Just the Tesla's cable sensor, not the whole bundle.
+
+        Polled a few times a minute while the Tesla is the car on the cable,
+        so it reads one entity instead of read_tesla_state()'s four.  Still a
+        plain HA state read: nothing reaches Tessie and the car is not woken
+        (verified 2026-09-11).
+        """
+        return self.get_text_state_safe(TESLA_CHARGE_CABLE)
+
     # -- write helpers ---------------------------------------------------------
 
     def set_number(self, entity_id: str, value: float) -> None:
