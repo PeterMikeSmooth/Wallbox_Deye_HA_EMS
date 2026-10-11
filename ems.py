@@ -114,6 +114,15 @@ EV_OTHER = "other connected"
 EV_NONE = "disconnected"
 EV_UNKNOWN = "unknown"           # the Ioniq could not be reached — not "not the Ioniq"
 
+# The label the charger reports when a car has just been put on the cable.
+# 20 occurrences over five days (2026-10-06..11), every one a real plug-in,
+# always reached from "Locked", never mid-session.  That makes it a reliable
+# start-of-session marker, and the only way to notice a swap completed faster
+# than the unplug takes to confirm.
+GW_NEW_SESSION = "Connected — no current"
+
+TESLA_CABLE_GRACE_S = 30         # Tessie's cable usually beats the wallbox by
+TESLA_CABLE_POLL_S = 3           # 6-36 s, but trailed it by 4.5 s on 2026-10-06
 IONIQ_REFRESH_TIMEOUT_S = 60     # wait for the payload after force_update returns
 IONIQ_REFRESH_POLL_S = 3         # how often to look while waiting
 IONIQ_MAX_DATA_AGE_S = 120       # a payload older than this is not trusted
@@ -214,6 +223,7 @@ class EMS:
         self._last_wallbox_status = None    # last logged wallbox status string (cloud)
         self._last_gw_status = None         # last logged gateway charger_status
         self._plug_seen = None              # plug change read once, awaiting confirmation
+        self._ev_label = None               # last value published to ev_connected
         self._last_written_grid_ratio = None
         self._battery_voltage = 52.0        # last known battery voltage
         # Wallbox override detection
@@ -981,20 +991,47 @@ class EMS:
         # while another car was on the wallbox: the only disagreements were
         # 0.2 h total, in four 2-4 min bursts where the cable was simply
         # quicker than the wallbox's 5-minute-polled sensor.
-        tesla = ha.read_tesla_state()
-        cable = ha_text(tesla, "tesla_charge_cable")
-        location = ha_text(tesla, "tesla_location")
-        if cable == "on" and location == "home":
-            return EV_TESLA
-        log.info("EV id: not the Tesla (cable=%r location=%r)", cable, location)
+        #
+        # The cable usually flips 6-36 s before the wallbox sees the plug, but
+        # on 2026-10-06 it trailed it by 4.5 s and the Tesla was published as
+        # "other connected".  So give it a short grace before waking the Ioniq
+        # — a needless force_update costs a Bluelink request and a car wake-up.
+        deadline = time.monotonic() + TESLA_CABLE_GRACE_S
+        while True:
+            if self._tesla_on_cable(ha):
+                return EV_TESLA
+            if time.monotonic() >= deadline or generation != self._ev_id_generation:
+                break
+            time.sleep(TESLA_CABLE_POLL_S)
+        self._tesla_on_cable(ha, log_miss=True)
 
         # 2. Ioniq — the Bluelink cache runs ~2 h behind, so ask the car itself.
         ioniq = self._refresh_ioniq(ha, generation)
         if ioniq is None:
             # The car never answered.  That is "we do not know", not "some
             # other car" — saying EV_OTHER here would invent a third vehicle.
-            return EV_UNKNOWN
-        return self._verdict_from_ioniq(ioniq)
+            label = EV_UNKNOWN
+        else:
+            label = self._verdict_from_ioniq(ioniq)
+
+        # 3. Last look at the Tesla: free, and the Ioniq round-trip gave a
+        # late cable another 5-90 s to land.
+        if label != EV_IONIQ and self._tesla_on_cable(ha):
+            log.info("EV id: Tesla cable showed up late — overriding %r", label)
+            return EV_TESLA
+        return label
+
+    @staticmethod
+    def _tesla_on_cable(ha: HomeAssistantAPI, log_miss: bool = False) -> bool:
+        tesla = ha.read_tesla_state()
+        cable = ha_text(tesla, "tesla_charge_cable")
+        location = ha_text(tesla, "tesla_location")
+        if cable == "on" and location == "home":
+            return True
+        if log_miss:
+            log.info("EV id: not the Tesla after %d s (cable=%r location=%r)",
+                     TESLA_CABLE_GRACE_S, cable, location)
+        return False
 
     @staticmethod
     def _verdict_from_ioniq(ioniq: dict) -> str:
@@ -1100,6 +1137,7 @@ class EMS:
             log.info("EV id: dropping stale verdict %r", label)
             return
         log.info("EV connected: %s", label)
+        self._ev_label = label
         try:
             (ha or self.ha).set_ev_connected(label)
         except Exception:
@@ -1141,6 +1179,40 @@ class EMS:
     # "Ready" chatters with Locked for hours after an unplug, and every other
     # label seen (Charging, Connected — …, OCPP charge finishing) only with a
     # car.  Anything else (Error, Updating, …) is inconclusive.
+    def _tesla_cable_says_unplugged(self) -> bool:
+        """Does the Tesla itself report its cable out?
+
+        A second witness for the unplug, consulted only in the window where
+        the gateway flag already says off and its label has not caught up —
+        the label trails the flag by 0 to 19 s.  The Tesla's own cable sensor
+        is often ahead of both (8 s ahead of the flag on 2026-10-07 21:12),
+        and unlike anything power-based it does not follow the charge: it held
+        through five charge pauses on the night of 09-11.
+
+        Deliberately not in the 1 Hz batch: read only for the handful of ticks
+        that window lasts.  An HA state read never reaches Tessie anyway
+        (verified 2026-09-11, 200 reads in 2 s moved no last_updated).
+        """
+        try:
+            return ha_text(self.ha.read_tesla_state(), "tesla_charge_cable") == "off"
+        except Exception:
+            log.warning("Could not read the Tesla cable sensor", exc_info=True)
+            return False
+
+    def _reset_mode_for_new_session(self, s: dict) -> None:
+        """Hand a new session the default mode, no questions asked.
+
+        Unlike :meth:`_reset_mode_on_unplug` this skips the ev_power veto: the
+        charger has just announced a new session, which settles the question of
+        whether the previous one ended.
+        """
+        log.info("New session — resetting ems_mode to %s", config.DEFAULT_EMS_MODE)
+        try:
+            self.ha.set_ems_mode(config.DEFAULT_EMS_MODE)
+            s["ems_mode"] = config.DEFAULT_EMS_MODE
+        except Exception:
+            log.warning("Failed to reset ems_mode", exc_info=True)
+
     _GW_NO_CAR = ("Locked", "Ready")
     _GW_CAR = ("Charging", "Paused", "Schedule end", "Queued by Power Boost",
                "Queued by Eco-Smart", "Discharging", "OCPP charge finishing",
@@ -1159,10 +1231,10 @@ class EMS:
         - ``car_connected`` is the firmware's own flag, from ``r_dat.st``.  It
           never claimed a car that was not there, but it drops to off with the
           car still plugged when the charger reports a code missing from its
-          list: st 15 at the end of a charge (10-01 17:17, Ioniq full, still
-          plugged — ev_connected went to "disconnected" and the mode was
-          reset), and 12 s blips at the start of a charge (09-30 14:29,
-          10-01 16:59).  It also reads off before the gateway has any data.
+          list: st 15 at the end of a charge (10-01 19:17 local, Ioniq full,
+          still plugged — ev_connected went to "disconnected" and the mode the
+          user had picked five minutes earlier was reset), and 12 s blips at
+          the start of a charge (09-30 16:29, 10-01 18:59).  It also reads off before the gateway has any data.
         - the ``charger_status`` label comes from a separate read
           (``r_sta.charger_status``).  In all three false offs it still named
           a car ("OCPP charge finishing", "Connected — …").
@@ -1284,13 +1356,41 @@ class EMS:
             log.info("Wallbox status: %r → %r", self._last_wallbox_status, status)
             self._last_wallbox_status = status
         gw_status = s.get("gw_charger_status")
+        prev_gw = self._last_gw_status
         if gw_status != self._last_gw_status:
             log.info("Gateway status: %r → %r (car_connected=%s)",
                      self._last_gw_status, gw_status, s.get("gw_car_connected"))
             self._last_gw_status = gw_status
         status = gw_status
 
+        # A swap can be quicker than the unplug takes to confirm: the label
+        # trails the flag by up to 19 s, so putting the second car on the
+        # cable inside that window leaves BOTH edges unseen — the previous
+        # car's identification and the mode chosen for it would carry over.
+        # The charger announces the new session itself, so close the old one
+        # here and let the normal plug-in edge identify the newcomer.
+        if (gw_status == GW_NEW_SESSION and prev_gw != GW_NEW_SESSION
+                and self._car_connected is True):
+            log.info("Gateway announces a new session (%r) while a car was "
+                     "still believed connected — treating it as a swap",
+                     GW_NEW_SESSION)
+            self._ev_id_generation += 1
+            self._write_ev_connected(EV_NONE)
+            self._reset_mode_for_new_session(s)
+            self._car_connected = False
+            self._plug_seen = None
+
         plugged = self._car_plugged(s)
+        # Tesla session: take the car's own word rather than waiting for the
+        # gateway label.  Only while we still believe a car is on the cable
+        # and the flag already disagrees — see _tesla_cable_says_unplugged().
+        if (plugged is True and self._car_connected is True
+                and s.get("gw_car_connected") == "off"
+                and self._ev_label == EV_TESLA
+                and self._tesla_cable_says_unplugged()):
+            log.info("Tesla reports its cable out — unplug confirmed without "
+                     "waiting for the gateway label (%r)", gw_status)
+            plugged = False
         # A change must be read on two ticks in a row.  HA publishes
         # car_connected and charger_status one after the other, and our two
         # GETs can land in between: a stale "off" paired with a fresh known
