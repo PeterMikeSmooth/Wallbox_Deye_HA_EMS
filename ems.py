@@ -104,8 +104,9 @@ BATT_PRIO_RELEASE_AT = (12, 24)     # local (hour, minute): start of midday off-
 # Which car is on the cable (written to input_text.ev_connected)
 #
 # Identification runs on the DISCONNECTED -> CONNECTED edge, off the 1 Hz loop:
-# kia_uvo.force_update is synchronous and took 29 s when measured on
-# 2026-09-20, so it must never block a tick.
+# the Ioniq's OBD dongle takes 5-90 s to answer, and the Bluelink fallback
+# (kia_uvo.force_update) is synchronous and took 29 s when measured on
+# 2026-09-20, so neither may block a tick.
 # ---------------------------------------------------------------------------
 
 EV_TESLA = "Tesla connected"
@@ -136,6 +137,19 @@ IONIQ_FORCE_ATTEMPTS = 3         # DuplicateRequestError is transient — retry
 IONIQ_RETRY_DELAY_S = 30         # let the in-flight request finish first
 IONIQ_LATE_WATCH_S = 4200        # 70 min: long enough to catch the hourly
 IONIQ_LATE_POLL_S = 60           # HA automation that refreshes the car anyway
+
+# The Ioniq's OBD dongle, asked before Bluelink since 2026-10-14 (the Hyundai
+# API was down all that day: three Ioniq plug-ins published "unknown").
+IONIQ_OBD_TIMEOUT_S = 150        # a mute BMS is retried 6 × 10 s: ~90 s worst
+IONIQ_OBD_POLL_S = 2
+IONIQ_OBD_RETRY_S = 30           # second try after "injoignable"
+IONIQ_OBD_MAX_READS = 3
+
+# What the dongle says about the Ioniq (see _ask_ioniq_dongle).
+OBD_PLUGGED = "plugged"
+OBD_UNPLUGGED = "unplugged"
+OBD_ASLEEP = "asleep"
+OBD_GONE = "gone"
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +246,9 @@ class EMS:
         self._ev_label = None               # last value published to ev_connected
         self._tesla_cable_ts = 0.0          # monotonic ts of the last cable poll
         self._tesla_cable_off = False       # last cable reading, cached between polls
+        self._dongle_lock = threading.Lock()  # one plug reading at a time: one shared button
+        self._swap_check_running = False    # a thread is asking the Ioniq about a swap
+        self._swap_verdict = None           # (generation, accept) handed back by that thread
         self._last_written_grid_ratio = None
         self._battery_voltage = 52.0        # last known battery voltage
         # Wallbox override detection
@@ -988,7 +1005,7 @@ class EMS:
             self._late_ioniq_watch(ha, generation)
 
     def _detect_plugged_car(self, ha: HomeAssistantAPI, generation: int) -> str:
-        """Which car is on the cable?  Tesla first, then Ioniq, else "other"."""
+        """Which car is on the cable?  Tesla, then the Ioniq's dongle, then Bluelink."""
         # 1. Tesla — free: HA answers from its cache and the car is never woken.
         #
         # The cable sensor, not the charging state: over 9 days the Tesla was
@@ -1013,16 +1030,31 @@ class EMS:
             time.sleep(TESLA_CABLE_POLL_S)
         self._tesla_on_cable(ha, log_miss=True)
 
-        # 2. Ioniq — the Bluelink cache runs ~2 h behind, so ask the car itself.
-        ioniq = self._refresh_ioniq(ha, generation)
-        if ioniq is None:
-            # The car never answered.  That is "we do not know", not "some
-            # other car" — saying EV_OTHER here would invent a third vehicle.
-            label = EV_UNKNOWN
+        # 2. Ioniq — its own OBD dongle first.  An Ioniq just put on the cable
+        # is awake and answers in 3-6 s (5 plug-ins out of 5); one asleep
+        # nearby does not answer, and the dongle does not wake it.  So
+        # "asleep" means the Ioniq is parked here but is not the car on the
+        # cable (user decision 2026-10-14).
+        dongle = self._ask_ioniq_dongle(ha, generation)
+        if dongle == OBD_PLUGGED:
+            label = EV_IONIQ
+        elif dongle in (OBD_UNPLUGGED, OBD_ASLEEP, OBD_GONE):
+            log.info("EV id: not the Ioniq (dongle: %s)", dongle)
+            label = EV_OTHER
+        elif generation != self._ev_id_generation:
+            return EV_UNKNOWN  # superseded: _write_ev_connected drops it anyway
         else:
-            label = self._verdict_from_ioniq(ioniq)
+            # 3. Dongle unavailable — the Bluelink cache runs ~2 h behind, so
+            # ask the car itself through the Hyundai API.
+            ioniq = self._refresh_ioniq(ha, generation)
+            if ioniq is None:
+                # The car never answered.  That is "we do not know", not "some
+                # other car" — saying EV_OTHER here would invent a third vehicle.
+                label = EV_UNKNOWN
+            else:
+                label = self._verdict_from_ioniq(ioniq)
 
-        # 3. Last look at the Tesla: free, and the Ioniq round-trip gave a
+        # 4. Last look at the Tesla: free, and the Ioniq round-trip gave a
         # late cable another 5-90 s to land.
         if label != EV_IONIQ and self._tesla_on_cable(ha):
             log.info("EV id: Tesla cable showed up late — overriding %r", label)
@@ -1049,6 +1081,86 @@ class EMS:
             return EV_IONIQ
         log.info("EV id: not the Ioniq (location=%r plug=%r)", loc, plug)
         return EV_OTHER
+
+    def _ask_ioniq_dongle(self, ha: HomeAssistantAPI, generation: int) -> str | None:
+        """Is the Ioniq on the cable?  Asked of its own OBD dongle.
+
+        Returns OBD_PLUGGED, OBD_UNPLUGGED, OBD_ASLEEP, OBD_GONE, or None
+        when the dongle cannot tell (gateway down, ELM mute, request refused
+        or interrupted, no result in time, or a newer session took over).
+
+        Two answers need a second read before they count:
+
+        - "not plugged": on 2026-10-14 at 10:23:43 one well-formed 220105
+          cleared the plug bit between two set ones, Ioniq plugged and locked;
+        - "injoignable": the same evening, the first call after the gateway's
+          Bluetooth started failed twice with the Ioniq parked right there.
+          Asked again 30 s later; a second failure means it has left.
+
+        The gateway keeps the link one minute after a reading, so the
+        confirmation of a "not plugged" is immediate.
+        """
+        with self._dongle_lock:
+            unplugged = unreachable = 0
+            for _ in range(IONIQ_OBD_MAX_READS):
+                if generation != self._ev_id_generation:
+                    return None
+                reading = self._read_ioniq_dongle_once(ha, generation)
+                if reading is None:
+                    return None
+                result, attrs = reading
+                if result == "ok":
+                    if attrs.get("branche") is True:
+                        return OBD_PLUGGED
+                    unplugged += 1
+                    if unplugged >= 2:
+                        return OBD_UNPLUGGED
+                    log.info("EV id: dongle reads the Ioniq unplugged (raw 0x%02X) — confirming",
+                             attrs.get("brut") or 0)
+                elif result == "endormie":
+                    return OBD_ASLEEP
+                elif result == "injoignable":
+                    unreachable += 1
+                    if unreachable >= 2:
+                        return OBD_GONE
+                    log.info("EV id: dongle unreachable — trying again in %d s", IONIQ_OBD_RETRY_S)
+                    time.sleep(IONIQ_OBD_RETRY_S)
+                else:
+                    log.info("EV id: dongle cannot tell (%r)", result)
+                    return None
+            return None
+
+    def _read_ioniq_dongle_once(self, ha: HomeAssistantAPI,
+                                generation: int) -> tuple[str, dict] | None:
+        """Press the gateway's read button and wait for this request's result.
+
+        The result entity carries a counter that changes with every result,
+        so even an identical answer moves its ``last_updated``.
+        """
+        before = ha.read_ioniq_obd_result()
+        if before is None or before.get("state") == "unavailable":
+            log.info("EV id: OBD gateway unavailable (%r)",
+                     before and before.get("state"))
+            return None
+        try:
+            ha.press_ioniq_obd_read()
+        except Exception:
+            log.warning("EV id: could not press the OBD read button", exc_info=True)
+            return None
+        start = time.monotonic()
+        deadline = start + IONIQ_OBD_TIMEOUT_S
+        while time.monotonic() < deadline:
+            time.sleep(IONIQ_OBD_POLL_S)
+            if generation != self._ev_id_generation:
+                return None
+            now = ha.read_ioniq_obd_result()
+            if now and now.get("last_updated") != before.get("last_updated"):
+                attrs = now.get("attributes") or {}
+                log.info("EV id: dongle answered %r in %.0f s (plugged=%r)", now.get("state"),
+                         time.monotonic() - start, attrs.get("branche"))
+                return now.get("state"), attrs
+        log.warning("EV id: no answer from the OBD gateway within %d s", IONIQ_OBD_TIMEOUT_S)
+        return None
 
     def _refresh_ioniq(self, ha: HomeAssistantAPI, generation: int) -> dict | None:
         """Get a fresh Bluelink payload, retrying a busy car.
@@ -1234,6 +1346,80 @@ class EMS:
         except Exception:
             log.warning("Failed to reset ems_mode", exc_info=True)
 
+    def _on_new_session_marker(self, s: dict) -> None:
+        """The charger announces a new session while a car is still on record.
+
+        A real swap, or the charger relabelling a session in progress?  Both
+        happen: of the four times the label arrived mid-session from 09-24 to
+        10-14, three were genuine swaps (10-06 09:32, 09:34 and 10:09, none of
+        them through Locked, the flag twice never dropping) and one was not
+        (10-14 10:21: the Ioniq's charger paused, nobody touched the cable,
+        and FULL_SPEED was wiped).  Neither the previous label nor the flag
+        tells them apart; the car on record does, by its own sensor:
+
+        - Tesla: its cable sensor still "on" means it is still plugged;
+        - Ioniq (or unknown, which on 10-14 was the Ioniq every time): its
+          OBD dongle is asked in a thread.  In doubt — asleep, no answer —
+          the session is kept: a car just unplugged is awake and answers,
+          and the next charge restarts the relevé and corrects us if needed;
+        - any other car has no witness: the swap is taken, as before.
+        """
+        label = self._ev_label
+        if label == EV_TESLA:
+            cable = self.ha.read_tesla_cable()
+            if cable == "on":
+                log.info("Gateway announces a new session (%r) but the Tesla's cable "
+                         "is still plugged — session kept", GW_NEW_SESSION)
+                return
+            log.info("Gateway announces a new session (%r) and the Tesla's cable reads %r "
+                     "— treating it as a swap", GW_NEW_SESSION, cable)
+            self._close_session_for_swap(s)
+        elif label in (EV_IONIQ, EV_UNKNOWN):
+            if self._swap_check_running:
+                log.info("Gateway announces a new session again — swap check already running")
+                return
+            log.info("Gateway announces a new session (%r) while %r is on record — "
+                     "asking the Ioniq before closing anything", GW_NEW_SESSION, label)
+            self._swap_check_running = True
+            threading.Thread(target=self._swap_check_blocking,
+                             args=(self._ev_id_generation, label),
+                             name="ev-swap-check", daemon=True).start()
+        else:
+            log.info("Gateway announces a new session (%r) while %r is on record "
+                     "— treating it as a swap", GW_NEW_SESSION, label)
+            self._close_session_for_swap(s)
+
+    def _swap_check_blocking(self, generation: int, label: str) -> None:
+        """Thread body: ask the Ioniq's dongle, hand the verdict to tick()."""
+        ha = HomeAssistantAPI(config.HA_URL, config.HA_TOKEN)
+        try:
+            dongle = self._ask_ioniq_dongle(ha, generation)
+            if dongle == OBD_PLUGGED:
+                log.info("Swap check: the Ioniq is still plugged — session kept")
+                if label == EV_UNKNOWN:
+                    self._write_ev_connected(EV_IONIQ, ha, generation)
+                accept = False
+            elif dongle in (OBD_UNPLUGGED, OBD_GONE):
+                log.info("Swap check: the Ioniq is %s — it is a swap", dongle)
+                accept = True
+            else:
+                log.info("Swap check: no clear answer from the Ioniq (%s) — session kept",
+                         dongle)
+                accept = False
+            self._swap_verdict = (generation, accept)
+        except Exception:
+            log.warning("Swap check failed — session kept", exc_info=True)
+        finally:
+            self._swap_check_running = False
+
+    def _close_session_for_swap(self, s: dict) -> None:
+        """End the session on record; the plug-in edge then identifies the newcomer."""
+        self._ev_id_generation += 1
+        self._write_ev_connected(EV_NONE)
+        self._reset_mode_for_new_session(s)
+        self._car_connected = False
+        self._plug_seen = None
+
     _GW_NO_CAR = ("Locked", "Ready")
     _GW_CAR = ("Charging", "Paused", "Schedule end", "Queued by Power Boost",
                "Queued by Eco-Smart", "Discharging", "OCPP charge finishing",
@@ -1388,18 +1574,19 @@ class EMS:
         # trails the flag by up to 19 s, so putting the second car on the
         # cable inside that window leaves BOTH edges unseen — the previous
         # car's identification and the mode chosen for it would carry over.
-        # The charger announces the new session itself, so close the old one
-        # here and let the normal plug-in edge identify the newcomer.
+        # The charger announces the new session itself — but it also does so
+        # mid-session, so the car on record is asked first (see
+        # _on_new_session_marker); on a swap the old session is closed and
+        # the normal plug-in edge identifies the newcomer.
         if (gw_status == GW_NEW_SESSION and prev_gw != GW_NEW_SESSION
                 and self._car_connected is True):
-            log.info("Gateway announces a new session (%r) while a car was "
-                     "still believed connected — treating it as a swap",
-                     GW_NEW_SESSION)
-            self._ev_id_generation += 1
-            self._write_ev_connected(EV_NONE)
-            self._reset_mode_for_new_session(s)
-            self._car_connected = False
-            self._plug_seen = None
+            self._on_new_session_marker(s)
+        # Verdict of a swap check that had to ask the Ioniq (thread).
+        verdict, self._swap_verdict = self._swap_verdict, None
+        if verdict is not None:
+            generation, accept = verdict
+            if accept and generation == self._ev_id_generation and self._car_connected is True:
+                self._close_session_for_swap(s)
 
         plugged = self._car_plugged(s)
         # Tesla session: take the car's own word, without waiting for the

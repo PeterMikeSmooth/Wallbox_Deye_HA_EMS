@@ -36,6 +36,13 @@ IONIQ_PLUG = "binary_sensor.moniq_ev_battery_plug"        # "on" = cable plugged
 IONIQ_DATA_TS = "sensor.moniq_location_last_updated"      # ISO ts of the vehicle payload
 IONIQ_DEVICE_ID = "902392daab65cd8ce308c9571af29bad"      # kia_uvo services target a device
 
+# The Ioniq's own OBD dongle, read through the ioniq38_tesla_esp32 gateway
+# (firmware >= 0.8.0): one 220105 to the BMS per press, and an explicit result
+# per request.  The gateway's link sensor cannot replace that result: outside a
+# relevé it falls back to "repos" within the second.
+IONIQ_OBD_READ_BUTTON = "button.moniq_obd_lecture_prise"
+IONIQ_OBD_READ_RESULT = "sensor.moniq_obd_resultat_lecture_prise"  # ok|endormie|injoignable|…
+
 INPUT_EV_CONNECTED = "input_text.ev_connected"
 
 NUMBER_MAX_CHARGING_CURRENT = "number.deye_battery_max_charging_current"
@@ -108,6 +115,18 @@ class HomeAssistantAPI:
         except Exception:
             return None
 
+    def get_entity_safe(self, entity_id: str) -> dict | None:
+        """The whole state object (state, attributes, last_updated), or None."""
+        try:
+            resp = self._session.get(
+                f"{self._base}/api/states/{entity_id}", timeout=10
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            logger.warning("Could not read %s", entity_id, exc_info=True)
+            return None
+
     def read_all_sensors(self) -> dict:
         """Read every sensor needed in one batch and return a dict."""
         return {
@@ -162,6 +181,23 @@ class HomeAssistantAPI:
             "ioniq_plug": self.get_text_state_safe(IONIQ_PLUG),
             "ioniq_data_ts": self.get_text_state_safe(IONIQ_DATA_TS),
         }
+
+    def read_ioniq_obd_result(self) -> dict | None:
+        """Result of the last one-shot plug reading, attributes included."""
+        return self.get_entity_safe(IONIQ_OBD_READ_RESULT)
+
+    def press_ioniq_obd_read(self) -> None:
+        """Ask the gateway for one plug reading.  Raises on error.
+
+        Never wakes a sleeping Ioniq (verified 2026-10-14 21:04: six reads in
+        50 s, no CAN traffic, the car stayed asleep), so it is safe to ask.
+        """
+        resp = self._session.post(
+            f"{self._base}/api/services/button/press",
+            json={"entity_id": IONIQ_OBD_READ_BUTTON},
+            timeout=10,
+        )
+        resp.raise_for_status()
 
     def read_tesla_cable(self) -> str | None:
         """Just the Tesla's cable sensor, not the whole bundle.
