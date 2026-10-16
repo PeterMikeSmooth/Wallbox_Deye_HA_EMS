@@ -128,6 +128,20 @@ GW_NEW_SESSION = "Connected — no current"
 # to drop the flag (measured 20:48:41 unplug -> 20:48:56 flag).
 TESLA_CABLE_POLL_S = 3
 
+# How long an unplug has to be confirmed by the car after the gateway's
+# readings come back.  A gateway that has just booted has not yet asked the
+# charger about the cable, and the charger itself may not know: on 2026-10-15
+# 17:01 a power cut rebooted the charger while the EMS survived on the
+# inverter's backup output, and the first readings said "no car" with the
+# Tesla plugged — both gateway fields agreeing, so nothing downstream could
+# catch it.  SOLAR_BOOSTED was wiped and had to be set again by hand.
+GW_RECOVERY_DOUBT_S = 90
+
+
+def gw_label_absent(label: str | None) -> bool:
+    """Is this gateway label a non-answer rather than a reading?"""
+    return (label or "").strip().lower() in ("", "unknown", "unavailable", "none")
+
 TESLA_CABLE_GRACE_S = 30         # Tessie's cable usually beats the wallbox by
 TESLA_CABLE_POLL_S = 3           # 6-36 s, but trailed it by 4.5 s on 2026-10-06
 IONIQ_REFRESH_TIMEOUT_S = 60     # wait for the payload after force_update returns
@@ -246,6 +260,7 @@ class EMS:
         self._ev_label = None               # last value published to ev_connected
         self._tesla_cable_ts = 0.0          # monotonic ts of the last cable poll
         self._tesla_cable_off = False       # last cable reading, cached between polls
+        self._gw_back_ts = 0.0              # monotonic ts of the gateway's last recovery
         self._dongle_lock = threading.Lock()  # one plug reading at a time: one shared button
         self._swap_check_running = False    # a thread is asking the Ioniq about a swap
         self._swap_verdict = None           # (generation, accept) handed back by that thread
@@ -1389,6 +1404,34 @@ class EMS:
                      "— treating it as a swap", GW_NEW_SESSION, label)
             self._close_session_for_swap(s)
 
+    def _unplug_survives_recovery_doubt(self) -> bool:
+        """Does the car on record agree it has left, so soon after a recovery?
+
+        Same witnesses as :meth:`_on_new_session_marker`, same bias: in doubt
+        the session is kept, because a mode wiped by mistake costs the user
+        more than a reset that lands a minute late.
+        """
+        label = self._ev_label
+        if label == EV_TESLA:
+            cable = self.ha.read_tesla_cable()
+            if cable == "on":
+                log.info("Gateway just came back and reads no car, but the Tesla's "
+                         "cable is still plugged — session kept")
+                return False
+            log.info("Gateway just came back and the Tesla's cable reads %r — "
+                     "unplug accepted", cable)
+            return True
+        if label in (EV_IONIQ, EV_UNKNOWN):
+            if not self._swap_check_running:
+                log.info("Gateway just came back and reads no car while %r is on "
+                         "record — asking the Ioniq before closing anything", label)
+                self._swap_check_running = True
+                threading.Thread(target=self._swap_check_blocking,
+                                 args=(self._ev_id_generation, label),
+                                 name="ev-recovery-check", daemon=True).start()
+            return False          # the thread's verdict closes the session if it must
+        return True               # no witness for any other car
+
     def _swap_check_blocking(self, generation: int, label: str) -> None:
         """Thread body: ask the Ioniq's dongle, hand the verdict to tick()."""
         ha = HomeAssistantAPI(config.HA_URL, config.HA_TOKEN)
@@ -1569,6 +1612,10 @@ class EMS:
                      self._last_gw_status, gw_status, s.get("gw_car_connected"))
             self._last_gw_status = gw_status
         status = gw_status
+        if gw_label_absent(prev_gw) and not gw_label_absent(gw_status):
+            self._gw_back_ts = time.monotonic()
+            log.info("Gateway readings are back (%r) — an unplug needs the car's "
+                     "own confirmation for the next %d s", gw_status, GW_RECOVERY_DOUBT_S)
 
         # A swap can be quicker than the unplug takes to confirm: the label
         # trails the flag by up to 19 s, so putting the second car on the
@@ -1598,6 +1645,14 @@ class EMS:
                      "the gateway (flag=%r label=%r)",
                      s.get("gw_car_connected"), gw_status)
             plugged = False
+        # An unplug read just after the gateway came back is not trusted on the
+        # gateway's word alone — see GW_RECOVERY_DOUBT_S.  Asking the car on
+        # record is the same question the swap check asks, so it reuses it.
+        if (plugged is False and self._car_connected is True
+                and self._gw_back_ts
+                and time.monotonic() - self._gw_back_ts < GW_RECOVERY_DOUBT_S
+                and not self._unplug_survives_recovery_doubt()):
+            plugged = None
         # A change must be read on two ticks in a row.  HA publishes
         # car_connected and charger_status one after the other, and our two
         # GETs can land in between: a stale "off" paired with a fresh known
