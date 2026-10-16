@@ -630,3 +630,15 @@ RestartSec=30
 [Install]
 WantedBy=multi-user.target
 ```
+
+### Charge-drop monitor (`chutes/`, optional)
+
+`chutes/chutes.py` is a separate, read-only service that records episodes where the car falls to ~1.2 kW (6 A) while the EMS asks for 10 A or more, or where the BLE gateway stops receiving fresh frames from the charger. It never writes to the charger, the gateway or the EMS.
+
+For each episode it keeps the previous 10 minutes and writes `chutes/data/<date_time>/` (5 s samples, gateway `/api/logs`, `ems.service` journal, `resume.json` with a first verdict), appends a line to `chutes/data/chutes.jsonl`, and updates `sensor.ems_chutes_charge` (episodes today, last verdict as attributes).
+
+```bash
+sudo cp chutes/systemd/ems-chutes.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ems-chutes.service
+journalctl -u ems-chutes -f
+```

@@ -219,3 +219,6 @@ MEMO_EMS_WALLBOX_DEYE.md
 
 # Sorties Octopus : journal de sessions = journal de présence, jamais sur GitHub
 octopus/data/
+
+# Episodes de chute : relevés bruts, jamais sur GitHub
+chutes/data/

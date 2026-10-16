@@ -1,0 +1,17 @@
+[Unit]
+Description=Surveillance des chutes de charge a ~1,2 kW (lecture seule)
+Documentation=file:/home/raspAutel/projects/Wallbox_Deye_HA_EMS/chutes/chutes.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=raspAutel
+WorkingDirectory=/home/raspAutel/projects/Wallbox_Deye_HA_EMS/chutes
+ExecStart=/usr/bin/python3 -u /home/raspAutel/projects/Wallbox_Deye_HA_EMS/chutes/chutes.py
+# Un diagnostic, jamais critique : on relance sans insister.
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
