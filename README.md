@@ -125,7 +125,9 @@ All sensor reads and actuator writes go through the **Home Assistant REST API** 
 
 ### Car unplug reset
 
-When the wallbox reports the car has just been **unplugged**, `ems_mode` is reset to `DEFAULT_EMS_MODE` (`SOLAR_ONLY`), so the next session starts from a safe, predictable mode. Plugging in only logs; it never touches the mode, so the user can plug in and pick a mode without it being overwritten underneath them.
+When the wallbox reports the car has just been **unplugged**, `ems_mode` is reset to `DEFAULT_EMS_MODE` (`SOLAR_ONLY`), so the next session starts from a safe, predictable mode.
+
+On plug-in, the mode is only touched **between sunset and sunrise** (`sun.sun` = `below_horizon`): if it is still `DEFAULT_EMS_MODE`, it becomes `FULL_SPEED`, for any car — without sun, `SOLAR_ONLY` would only give it 6 A. A mode picked before plugging in is kept, and `FULL_SPEED` then stays until the unplug, sunrise included. In daylight, plugging in only logs, so the user can plug in and pick a mode without it being overwritten underneath them. An EMS start with a car already on the cable is not a plug-in and changes nothing.
 
 Doing it at unplug also makes the detection latency free: the mode is only consumed by the *next* session, so a reset that lands minutes late is still correct.
 

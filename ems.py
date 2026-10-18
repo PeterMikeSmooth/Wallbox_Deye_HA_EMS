@@ -159,6 +159,10 @@ IONIQ_OBD_POLL_S = 2
 IONIQ_OBD_RETRY_S = 30           # second try after "injoignable"
 IONIQ_OBD_MAX_READS = 3
 
+# A car plugged in between sunset and sunrise starts in FULL_SPEED (user
+# decision of 2026-10-18): without sun, SOLAR_ONLY only gives it 6 A.
+SUN_ENTITY = "sun.sun"
+
 # What the dongle says about the Ioniq (see _ask_ioniq_dongle).
 OBD_PLUGGED = "plugged"
 OBD_UNPLUGGED = "unplugged"
@@ -1278,6 +1282,31 @@ class EMS:
         except Exception:
             log.warning("Failed to write ev_connected=%s", label, exc_info=True)
 
+    def _full_speed_after_dark(self, s: dict) -> None:
+        """Plug-in between sunset and sunrise: start the session in FULL_SPEED.
+
+        Only the default mode is replaced: a mode the user picked before
+        plugging in is theirs.  Once set, FULL_SPEED stays until the unplug,
+        sunrise included, like a mode picked by hand.  Any car, so there is no
+        waiting for the identification.  An unreadable sun leaves the mode
+        alone.  An EMS start with a car already on the cable is not a plug-in
+        and changes nothing.
+        """
+        mode = (s.get("ems_mode") or "").upper()
+        if mode != config.DEFAULT_EMS_MODE:
+            log.info("Plug-in: mode %s chosen beforehand — left untouched", mode)
+            return
+        sun = self.ha.get_text_state_safe(SUN_ENTITY)
+        if sun != "below_horizon":
+            log.info("Plug-in: sun %r — mode left untouched", sun)
+            return
+        log.info("Plug-in after sunset — ems_mode %s → FULL_SPEED", mode)
+        try:
+            self.ha.set_ems_mode("FULL_SPEED")
+            s["ems_mode"] = "FULL_SPEED"
+        except Exception:
+            log.warning("Failed to set ems_mode to FULL_SPEED", exc_info=True)
+
     def _reset_mode_on_unplug(self, s: dict, status: str) -> None:
         """Car unplugged: hand the next session back the default mode.
 
@@ -1670,9 +1699,8 @@ class EMS:
             if plugged != self._car_connected and self._car_connected is not None:
                 self._ev_id_generation += 1
             if plugged and self._car_connected is False:
-                # Plug-in: observation only.  The mode is deliberately left
-                # alone so the user can pick one while the car sits waiting.
-                log.info("Car plugged in (gateway: %r) — mode left untouched", status)
+                log.info("Car plugged in (gateway: %r)", status)
+                self._full_speed_after_dark(s)
                 self._identify_plugged_car()
             elif not plugged and self._car_connected is True:
                 self._reset_mode_on_unplug(s, status)
