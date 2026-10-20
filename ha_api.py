@@ -2,6 +2,7 @@
 
 import logging
 import requests
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ IONIQ_DEVICE_ID = "902392daab65cd8ce308c9571af29bad"      # kia_uvo services tar
 # relevé it falls back to "repos" within the second.
 IONIQ_OBD_READ_BUTTON = "button.moniq_obd_lecture_prise"
 IONIQ_OBD_READ_RESULT = "sensor.moniq_obd_resultat_lecture_prise"  # ok|endormie|injoignable|…
+IONIQ_OBD_BLE_RSSI = "sensor.moniq_obd_bluetooth_rssi"  # dated, for presence
 
 INPUT_EV_CONNECTED = "input_text.ev_connected"
 
@@ -198,6 +200,28 @@ class HomeAssistantAPI:
             timeout=10,
         )
         resp.raise_for_status()
+
+    def read_ioniq_ble_contact_age_s(self) -> float | None:
+        """Seconds since the OBD gateway last reported the BLE link to the car.
+
+        A *fresh* report means the car is within BLE range of the gateway,
+        which is presence evidence even when the exchange itself fails.  The
+        value alone is not: on 2026-10-20 the RSSI read -98 dBm but had not
+        been reported for 3 h 45, while the same gateway's uptime and WiFi
+        RSSI were 0.3 min old — the link had simply stopped, and -98 was the
+        last reading before it did.  Hence the age, not the level.
+        """
+        entity = self.get_entity_safe(IONIQ_OBD_BLE_RSSI)
+        if not entity:
+            return None
+        stamp = entity.get("last_reported") or entity.get("last_updated")
+        if not stamp:
+            return None
+        try:
+            when = datetime.fromisoformat(stamp)
+        except ValueError:
+            return None
+        return (datetime.now(when.tzinfo) - when).total_seconds()
 
     def read_tesla_cable(self) -> str | None:
         """Just the Tesla's cable sensor, not the whole bundle.

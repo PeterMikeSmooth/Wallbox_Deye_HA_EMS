@@ -169,6 +169,10 @@ OBD_UNPLUGGED = "unplugged"
 OBD_ASLEEP = "asleep"
 OBD_GONE = "gone"
 
+# A BLE contact report younger than this means the Ioniq is within range of
+# its OBD gateway, so it is the car here even if the exchange itself failed.
+IONIQ_BLE_FRESH_S = 300
+
 
 # ---------------------------------------------------------------------------
 # State enum
@@ -1057,9 +1061,19 @@ class EMS:
         dongle = self._ask_ioniq_dongle(ha, generation)
         if dongle == OBD_PLUGGED:
             label = EV_IONIQ
-        elif dongle in (OBD_UNPLUGGED, OBD_ASLEEP, OBD_GONE):
+        elif dongle in (OBD_UNPLUGGED, OBD_ASLEEP):
             log.info("EV id: not the Ioniq (dongle: %s)", dongle)
             label = EV_OTHER
+        elif dongle == OBD_GONE:
+            # "Unreachable" says nothing about which car is on the cable,
+            # unlike "unplugged" and "asleep" which do.  Treating it as "some
+            # other car" published "other connected" twice on 2026-10-20 for
+            # an Ioniq that was plugged in, and an "other" label disarms every
+            # witness downstream — the swap check then accepts a swap without
+            # asking anyone.  So fall through to the car's other witnesses,
+            # and only a positive "away" rules it out (user decision
+            # 2026-10-20).
+            label = self._ioniq_present_despite_silence(ha, generation)
         elif generation != self._ev_id_generation:
             return EV_UNKNOWN  # superseded: _write_ev_connected drops it anyway
         else:
@@ -1091,6 +1105,36 @@ class EMS:
             log.info("EV id: not the Tesla after %d s (cable=%r location=%r)",
                      TESLA_CABLE_GRACE_S, cable, location)
         return False
+
+    def _ioniq_present_despite_silence(self, ha: HomeAssistantAPI,
+                                       generation: int) -> str:
+        """The dongle is unreachable — is the Ioniq here anyway?
+
+        Two witnesses left, and the bias is deliberate: only a positive "away"
+        rules the Ioniq out.  A silence must not become a verdict.
+
+        1. The BLE contact age.  The gateway reporting its link to the car
+           means the car is within range, whatever the level — but the report
+           has to be recent, see read_ioniq_ble_contact_age_s().
+        2. Bluelink.  Its location is what decides: "not_home" is the only
+           answer that makes this another car.  No answer at all, or an
+           unknown location, leaves the Ioniq as the conclusion.
+        """
+        age = ha.read_ioniq_ble_contact_age_s()
+        if age is not None and age <= IONIQ_BLE_FRESH_S:
+            log.info("EV id: dongle silent but its BLE link to the car was "
+                     "reported %.0f s ago — the Ioniq is here", age)
+            return EV_IONIQ
+        log.info("EV id: dongle silent and no recent BLE contact (%s) — asking Bluelink",
+                 ("%.0f s" % age) if age is not None else "never")
+        ioniq = self._refresh_ioniq(ha, generation)
+        location = ha_text(ioniq, "ioniq_location") if ioniq else None
+        if location is not None and location != "home":
+            log.info("EV id: Bluelink puts the Ioniq %r — it is another car", location)
+            return EV_OTHER
+        log.info("EV id: Bluelink does not place the Ioniq away (location=%r) — "
+                 "keeping the Ioniq", location)
+        return EV_IONIQ
 
     @staticmethod
     def _verdict_from_ioniq(ioniq: dict) -> str:
