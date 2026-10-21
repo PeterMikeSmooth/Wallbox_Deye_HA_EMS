@@ -106,19 +106,21 @@ def releve_passerelle(s):
     if err or not r.ok:
         s["gw_err"] = err or f"HTTP {r.status_code}"
         return
-    d = r.json()
-    st, rt = d.get("status", {}), d.get("realtime", {})
+    # Juste après un redémarrage, la passerelle répond avant d'avoir parlé à la
+    # borne : blocs à null (21/10 17:15:46, AttributeError en boucle 20 s).
+    d = r.json() or {}
+    st, rt = d.get("status") or {}, d.get("realtime") or {}
+    sr, rr = st.get("r") or {}, rt.get("r") or {}
     s.update(gw_cache_age=d.get("cache_age"), gw_ble=d.get("ble"),
              gw_status_id=st.get("id"), gw_rt_id=rt.get("id"),
-             gw_st=st.get("r", {}).get("st"), gw_cur=st.get("r", {}).get("cur"),
-             gw_cp_kw=st.get("r", {}).get("cp"),
-             gw_mcc=rt.get("r", {}).get("max_charging_current"),
-             gw_charger_status=rt.get("r", {}).get("charger_status"),
-             gw_ocpp=rt.get("r", {}).get("ocpp_status"),
-             gw_error_code=rt.get("r", {}).get("error_code"))
+             gw_st=sr.get("st"), gw_cur=sr.get("cur"), gw_cp_kw=sr.get("cp"),
+             gw_mcc=rr.get("max_charging_current"),
+             gw_charger_status=rr.get("charger_status"),
+             gw_ocpp=rr.get("ocpp_status"),
+             gw_error_code=rr.get("error_code"))
     r, err, _ = chrono(gw.get, PASSERELLE + "/api/status", timeout=8)
     if not err and r.ok:
-        d = r.json()
+        d = r.json() or {}
         for k in ("wifi_rssi", "rssi", "ble_last_activity_s", "last_command_by",
                   "last_command_age_s", "uptime", "ble_paused", "heap"):
             s["gw_" + k] = d.get(k)
@@ -218,6 +220,7 @@ class Episode:
             "tesla_demande_a_min": mini("tesla_demande_a"),
             "gw_mcc_min": mini("gw_mcc"), "gw_cur_min": mini("gw_cur"),
             "gw_gel_max_s": maxi("gw_gel_s"),
+            "gw_gel_http_max_s": maxi("gw_gel_http_s"),
             "gw_echecs_http": sum(1 for s in p if s.get("gw_err")),
             "gw_cache_age_max": maxi("gw_cache_age"),
             "gw_wifi_rssi_min": mini("gw_wifi_rssi"),
@@ -232,10 +235,19 @@ def verdict(r):
     """Une première lecture ; les relevés bruts restent la référence."""
     if r["gw_mcc_min"] is not None and r["gw_mcc_min"] <= 6:
         return f"la borne annonce elle-même {r['gw_mcc_min']} A (limite côté borne, OCPP ?)"
+    # Uptime en secondes : plus court que l'épisode = redémarrage pendant celui-ci.
+    reboot = (f", redémarrée (uptime {r['gw_uptime_min']} s)"
+              if r["gw_uptime_min"] is not None and r["gw_uptime_min"] < r["duree_s"]
+              else "")
+    # Un gel HTTP n'est pas un silence BLE : le 21/10 la passerelle était hors
+    # réseau (ConnectTimeout), le verdict disait « borne muette en BLE ? ».
+    if (r["gw_gel_http_max_s"] or 0) >= GEL_S:
+        return (f"passerelle injoignable en HTTP pendant {r['gw_gel_http_max_s']} s "
+                f"({r['gw_echecs_http']} échecs, hors réseau ou plantée){reboot}")
     if (r["gw_gel_max_s"] or 0) >= GEL_S:
-        return f"passerelle sans trame fraîche de la borne pendant {r['gw_gel_max_s']} s (borne muette en BLE ?)"
+        return f"passerelle sans trame fraîche de la borne pendant {r['gw_gel_max_s']} s (borne muette en BLE ?){reboot}"
     if r["gw_echecs_http"]:
-        return f"passerelle injoignable en HTTP ({r['gw_echecs_http']} échecs)"
+        return f"passerelle injoignable en HTTP ({r['gw_echecs_http']} échecs){reboot}"
     if r["ha_echecs"]:
         return f"HA en échec ({r['ha_echecs']} lectures ratées)"
     return "borne, passerelle et HA normales : limite côté voiture ?"
@@ -305,6 +317,7 @@ def main():
                 gel_http = t0 - gw_ok_depuis
                 gel_trames = max((t0 - depuis for _, depuis in trames.values()), default=0)
                 s["gw_gel_s"] = int(max(gel_http, gel_trames))
+                s["gw_gel_http_s"] = int(gel_http)
             else:
                 suivi = False
 
