@@ -421,6 +421,8 @@ template:
       #   vie       : utility_meter cycle none sur les cumuls ; cout_energie_vie = integration de
       #               cout_energie_live + abonnement/24 (template « Coût énergie live avec abonnement »)
       #   rachat    : rachat_surplus_live → cumul → rachat_surplus_{jour,mois,annee,vie}
+      #   coût net  : cout_net_{jour,mois,annee,vie} = cout_energie_* − rachat_surplus_* (rachat NET Urban),
+      #               affiché à la place du coût réel dans l'onglet Eco (21/10)
       #   amortir   : reste_a_amortir_{installation,batterie} = 10384,77 / 3002 − économies vie,
       #               rentabilite_{installation,batterie} = date estimée (device_class date)
       #   Compteurs en net_consumption: true + periodically_resetting: false,
