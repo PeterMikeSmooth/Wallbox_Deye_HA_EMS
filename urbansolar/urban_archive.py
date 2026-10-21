@@ -42,7 +42,9 @@ ARCHIVE = os.path.join(DATA, "urban_archive.json")
 
 PRIX_HA = "input_number.prix_rachat_surplus"   # utilisé par les templates d'économie
 ABO_HA = "input_number.cout_abonnement_rachat"  # €/kWh injecté, idem
-DEBUT_ABO = "2026-09"                          # CGA du 01/09/2026
+DEBUT_ABO = "2025-12"                          # contrat BMS du 17/12/2025 : la règle du 01/09/2026
+                                               # (surplus annuel / 500) est supposée s'appliquer à toute
+                                               # la 1re année, réglée à l'anniversaire (à vérifier le 17/12/2026)
 NOTIFY = "mobile_app_iphone2"
 RELEVE_MAX_AGE = dt.timedelta(hours=20)
 
