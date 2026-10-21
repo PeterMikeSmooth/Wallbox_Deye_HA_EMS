@@ -78,7 +78,7 @@ Two recurring missions run under every mode:
 | `input_select.ems_mode` | Active mode (see [Modes](#modes--states)) | 4 options | `SOLAR_ONLY` |
 | `input_number.batt_charge_limit` | Max SOC the battery is allowed to charge to | 50 – 100 % | 80 % |
 | `input_number.batt_charge_prio` | SOC target reached before solar surplus goes to the EV | 0 – 100 % | auto |
-| `input_number.discharge_limit` | SOC floor — battery won't discharge for the EV below this | 20 – 100 % | auto |
+| `input_number.discharge_limit` | SOC floor — battery won't discharge for the EV below this | 10 – 100 % | auto |
 
 ### Status Outputs (written by the script, for dashboards)
 
@@ -607,7 +607,7 @@ nano config.py      # Fill in HA IP + token
 #                            STORAGE_ONLY
 #   input_number.batt_charge_limit   (50–100 %, step 5, default 80)
 #   input_number.batt_charge_prio    (0–100 %)
-#   input_number.discharge_limit     (20–100 %)
+#   input_number.discharge_limit     (10–100 %)
 #   input_number.grid_ratio_value    (status display, 0–100 %)
 #   input_number.range_needed_over_night (status display, 0–100 %)
 
