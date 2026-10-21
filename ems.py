@@ -1367,11 +1367,11 @@ class EMS:
         """
         if s["ev_power"] > config.EV_CHARGING_DETECT_W:
             log.info(
-                "Car unplugged per gateway (%r) but EV still draws %.0f W — "
+                "Car unplugged per %s but EV still draws %.0f W — "
                 "mode left untouched", status, s["ev_power"],
             )
             return
-        log.info("Car unplugged (gateway: %r) — resetting ems_mode to %s",
+        log.info("Car unplugged (%s) — resetting ems_mode to %s",
                  status, config.DEFAULT_EMS_MODE)
         self._write_ev_connected(EV_NONE)
         try:
@@ -1574,6 +1574,38 @@ class EMS:
             return False
         return None
 
+    _CLOUD_CAR = ("Charging", "Locked, car connected", "Waiting",
+                  "Waiting for car demand")
+    _CLOUD_NO_CAR = ("Locked", "Ready")
+
+    @classmethod
+    def _car_plugged_cloud(cls, s: dict) -> bool | None:
+        """Is a car plugged in, while the gateway has no reading at all?
+
+        The cloud ``status_description`` drove the detection until 2026-09-25
+        and was dropped for lagging (90 s polling) and once freezing.  Without
+        it, a gateway outage froze the plug state: on 2026-10-21 the gateway
+        was off the network 15:08 → 17:15, the Ioniq plugged in at 17:09 went
+        unseen — no identification, no plug-in rule — until it came back.
+
+        Replayed over 10 days (10-11 → 10-21) against the gateway's verdict:
+        the cloud never said "no car" mid-session.  Its only disagreements
+        are lags — 2 to 117 s behind each plug-in, and once "Charging" 16 min
+        after an unplug (10-18 12:56) — which here only delay an edge.
+
+        Power flowing proves a car whatever the cloud says: on 09-25 it sat on
+        "Ready" while the Tesla charged.  An unplug read here still goes
+        through the ``ev_power`` veto of :meth:`_reset_mode_on_unplug`.
+        """
+        if s["ev_power"] > config.EV_CHARGING_DETECT_W:
+            return True
+        label = s.get("wallbox_status")
+        if label in cls._CLOUD_CAR:
+            return True
+        if label in cls._CLOUD_NO_CAR:
+            return False
+        return None
+
     # -- state evaluation -----------------------------------------------------
 
     def _leave_storage_on_low_soc(self, s: dict) -> State:
@@ -1684,7 +1716,7 @@ class EMS:
             log.info("Gateway status: %r → %r (car_connected=%s)",
                      self._last_gw_status, gw_status, s.get("gw_car_connected"))
             self._last_gw_status = gw_status
-        status = gw_status
+        status = f"gateway: {gw_status!r}"
         if gw_label_absent(prev_gw) and not gw_label_absent(gw_status):
             self._gw_back_ts = time.monotonic()
             log.info("Gateway readings are back (%r) — an unplug needs the car's "
@@ -1709,6 +1741,10 @@ class EMS:
                 self._close_session_for_swap(s)
 
         plugged = self._car_plugged(s)
+        if plugged is None and gw_label_absent(gw_status):
+            plugged = self._car_plugged_cloud(s)
+            status = (f"cloud: {s.get('wallbox_status')!r}, "
+                      f"{s['ev_power']:.0f} W — gateway {gw_status!r}")
         # Tesla session: take the car's own word, without waiting for the
         # gateway to make up its mind — see _tesla_cable_says_unplugged().
         if (plugged is True and self._car_connected is True
@@ -1743,7 +1779,7 @@ class EMS:
             if plugged != self._car_connected and self._car_connected is not None:
                 self._ev_id_generation += 1
             if plugged and self._car_connected is False:
-                log.info("Car plugged in (gateway: %r)", status)
+                log.info("Car plugged in (%s)", status)
                 self._full_speed_after_dark(s)
                 self._identify_plugged_car()
             elif not plugged and self._car_connected is True:
@@ -1752,7 +1788,7 @@ class EMS:
                 # First conclusive reading since start: no edge, but
                 # ev_connected may be stale from before the restart.  The
                 # mode is not touched either way.
-                log.info("Car %s at startup (gateway: %r)",
+                log.info("Car %s at startup (%s)",
                          "plugged" if plugged else "not plugged", status)
                 if plugged:
                     self._identify_plugged_car()

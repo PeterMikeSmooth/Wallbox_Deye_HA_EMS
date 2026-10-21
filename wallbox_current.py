@@ -18,7 +18,8 @@ counts once ``number.<gateway>_max_current`` shows it — and that entity only
 has a value once the charger has answered at least once.
 
 Only the setpoint goes through here.  The plug state is read from the
-gateway directly by ``EMS._car_plugged`` — with no cloud fallback.
+gateway directly by ``EMS._car_plugged``, and from the cloud only while the
+gateway has no reading at all (``EMS._car_plugged_cloud``).
 """
 
 import logging
