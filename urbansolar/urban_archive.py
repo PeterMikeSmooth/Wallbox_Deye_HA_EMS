@@ -41,6 +41,8 @@ os.makedirs(DATA, exist_ok=True)
 ARCHIVE = os.path.join(DATA, "urban_archive.json")
 
 PRIX_HA = "input_number.prix_rachat_surplus"   # utilisé par les templates d'économie
+ABO_HA = "input_number.cout_abonnement_rachat"  # €/kWh injecté, idem
+DEBUT_ABO = "2026-09"                          # CGA du 01/09/2026
 NOTIFY = "mobile_app_iphone2"
 RELEVE_MAX_AGE = dt.timedelta(hours=20)
 
@@ -168,6 +170,8 @@ def bilan(a):
     surplus12 = sum(v["kwh"] for v in douze)
     kwc = a.get("kwc") or config.URBAN_KWC
     abo_ht_mois = 0.0 if surplus12 <= SEUIL_KWH_PAR_KWC * kwc else surplus12 / 500
+    # coût marginal : 12 mois × (1/500) € HT par kWh de surplus annuel, TTC
+    abo_kwh = (12 / 500 * TVA) if abo_ht_mois > 0 and dt.date.today().strftime("%Y-%m") >= DEBUT_ABO else 0.0
     # kWh exacts par mois civil (Enedis journalier) et solde estimé façon site : les mois
     # postérieurs au dernier mois valorisé comptent au dernier prix connu
     enedis = {}
@@ -180,7 +184,7 @@ def bilan(a):
         "solde": solde, "vie": vie, "en_attente": en_attente,
         "dernier_mois": dernier, "dernier_prix": prix.get(dernier),
         "surplus12": surplus12, "nb_mois12": len(douze), "kwc": kwc,
-        "abo_ttc_an": abo_ht_mois * 12 * TVA, "mois": mois,
+        "abo_ttc_an": abo_ht_mois * 12 * TVA, "abo_kwh": abo_kwh, "mois": mois,
         "enedis": dict(sorted(enedis.items())), "provisoire": provisoire, "solde_estime": estime,
         "dernier_jour": max(a.get("jours", {}) or [None]),
     }
@@ -222,20 +226,26 @@ def pousse_capteurs(a):
     pousse("sensor.urban_abonnement_estime", round(b["abo_ttc_an"], 2), "€", "Urban Solar abonnement estimé (an, TTC)",
            {**commun, "surplus_12_mois_kwh": b["surplus12"], "mois_comptes": b["nb_mois12"],
             "kwc": b["kwc"], "seuil_gratuite_kwh": SEUIL_KWH_PAR_KWC * b["kwc"],
+            "cout_par_kwh_injecte": round(b["abo_kwh"], 4),
             "regle": "CGA 01/09/2026 : surplus annuel / (kWc × 500) € HT/kWc/mois, retenu au règlement annuel"})
-    # le réglage des templates d'économie suit le dernier prix publié
+    # les réglages des templates d'économie suivent le dernier prix publié et l'abonnement
     if b["dernier_prix"]:
-        try:
-            r = requests.get(config.HA_URL + "/api/states/" + PRIX_HA, headers=HA, timeout=20)
-            actuel = float(r.json()["state"]) if r.ok else None
-            cible = round(b["dernier_prix"], 4)          # pas de l'input_number : 0,0001
-            if actuel is None or abs(actuel - cible) > 1e-6:
-                requests.post(config.HA_URL + "/api/services/input_number/set_value", headers=HA, timeout=20,
-                              json={"entity_id": PRIX_HA, "value": cible})
-                print(f"  {PRIX_HA} : {actuel} -> {b['dernier_prix']:.4f} ({b['dernier_mois']})")
-        except Exception as e:
-            print(f"  {PRIX_HA} : {e}")
+        regle(PRIX_HA, b["dernier_prix"], b["dernier_mois"])
+    regle(ABO_HA, b["abo_kwh"], f"{b['surplus12']} kWh sur 12 mois")
     return b
+
+
+def regle(eid, valeur, pourquoi):
+    try:
+        r = requests.get(config.HA_URL + "/api/states/" + eid, headers=HA, timeout=20)
+        actuel = float(r.json()["state"]) if r.ok else None
+        cible = round(valeur, 4)                     # pas des input_number : 0,0001
+        if actuel is None or abs(actuel - cible) > 1e-6:
+            requests.post(config.HA_URL + "/api/services/input_number/set_value", headers=HA, timeout=20,
+                          json={"entity_id": eid, "value": cible})
+            print(f"  {eid} : {actuel} -> {cible} ({pourquoi})")
+    except Exception as e:
+        print(f"  {eid} : {e}")
 
 
 def rapport(a):
