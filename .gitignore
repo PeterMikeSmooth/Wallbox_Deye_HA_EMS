@@ -222,3 +222,6 @@ octopus/data/
 
 # Episodes de chute : relevés bruts, jamais sur GitHub
 chutes/data/
+
+# Relevés Urban Solar : données de compte, jamais sur GitHub
+urbansolar/data/

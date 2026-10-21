@@ -1,0 +1,12 @@
+[Unit]
+Description=Relève Urban Solar (rachat de surplus) et republie les capteurs HA
+Documentation=file:/home/raspAutel/projects/Wallbox_Deye_HA_EMS/urbansolar/urban_archive.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=raspAutel
+WorkingDirectory=/home/raspAutel/projects/Wallbox_Deye_HA_EMS/urbansolar
+ExecStart=/usr/bin/python3 /home/raspAutel/projects/Wallbox_Deye_HA_EMS/urbansolar/urban_archive.py
+TimeoutStartSec=120

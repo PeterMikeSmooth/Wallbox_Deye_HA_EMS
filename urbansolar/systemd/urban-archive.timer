@@ -1,0 +1,15 @@
+[Unit]
+Description=Relevé Urban Solar (1 fois par 20 h) et republication horaire des capteurs
+
+[Timer]
+# Le script ne se connecte à Urban Solar que si son dernier relevé date de plus
+# de 20 h ; les autres passages republient seulement les capteurs, que HA
+# efface à chaque redémarrage.
+OnCalendar=hourly
+OnBootSec=4min
+RandomizedDelaySec=2m
+Persistent=false
+Unit=urban-archive.service
+
+[Install]
+WantedBy=timers.target
