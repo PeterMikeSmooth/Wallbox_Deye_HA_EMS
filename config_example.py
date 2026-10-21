@@ -41,3 +41,10 @@ DEFAULT_EMS_MODE = "SOLAR_ONLY"   # Mode restored when car is unplugged
 # Logging
 LOG_FILE = "logs/ems.log"
 LOG_LEVEL = "INFO"                # DEBUG for diagnostics
+
+
+# Urban Solar Energy — espace client (Boost Mon Surplus), lu par urbansolar/urban_archive.py
+URBAN_EMAIL = ""                  # adresse de connexion à espace-client.urbansolar.energy
+URBAN_PASSWORD = ""               # mot de passe (config.py est gitignoré, ne jamais le commiter)
+URBAN_PDL = "00000000000000"      # n° de PDL, celui de l'URL /pdl/<PDL>/mon-surplus
+URBAN_KWC = 3.0                   # puissance déclarée chez Urban Solar (seuil de gratuité de l'abonnement)
