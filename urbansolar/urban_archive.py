@@ -15,6 +15,9 @@ Sources (API de l'espace client, la même que le site) :
                            10) répartis sur les mois civils : ce n'est pas le
                            tableau « Mon surplus » du site, mais c'est ce qui
                            compose « Mon solde », donc ce qui sera payé.
+  - GetInjectionIndexes    index Enedis journaliers (Wh) : les kWh injectés exacts
+                           par jour, J-1. C'est la source du tableau « Mon surplus »,
+                           qui valorise les mois sans prix au dernier prix connu.
 
 Usage :
     python3 urban_archive.py              relevé si le dernier date de plus de 20 h,
@@ -58,6 +61,10 @@ REQ_SURPLUS = """query getConsumptions($pdlId: String!) {
   }
 }"""
 REQ_KWC = "query getPdlPVCapacity($pdlId: String!) { getPdlPVCapacity(pdlId: $pdlId) }"
+REQ_JOURS = """query GetInjectionIndexes($pdl: String!, $startDate: DateTime!, $endDate: DateTime!) {
+  getInjectionIndexes(pdl: $pdl, startDate: $startDate, endDate: $endDate) { d c { c i v } }
+}"""
+DEBUT_BOOST = dt.date(2025, 12, 1)     # 1er mois facturé par Boost Mon Surplus
 
 
 def mois_de(iso):
@@ -97,7 +104,7 @@ def charge():
     if os.path.exists(ARCHIVE):
         with open(ARCHIVE) as f:
             return json.load(f)
-    return {"mois": {}, "grille": {}, "index": [], "kwc": None, "releve": None}
+    return {"mois": {}, "grille": {}, "index": [], "jours": {}, "kwc": None, "releve": None}
 
 
 def sauve(a):
@@ -132,6 +139,18 @@ def releve(a):
         a["kwc"] = float(u.gql("getPdlPVCapacity", REQ_KWC, {"pdlId": config.URBAN_PDL})["getPdlPVCapacity"])
     except Exception:
         pass      # facultatif : on garde config.URBAN_KWC
+    # 3. index journaliers Enedis, mois par mois (fin ≤ aujourd'hui, sinon refus Enedis)
+    a.setdefault("jours", {})
+    aujourd_hui = dt.date.today()
+    debut = DEBUT_BOOST if not a["jours"] else (aujourd_hui.replace(day=1) - dt.timedelta(days=1)).replace(day=1)
+    while debut < aujourd_hui:
+        fin = min((debut + dt.timedelta(days=32)).replace(day=1), aujourd_hui)
+        for p in u.gql("GetInjectionIndexes", REQ_JOURS, {"pdl": config.URBAN_PDL,
+                       "startDate": f"{debut}T00:00:00.000Z", "endDate": f"{fin}T00:00:00.000Z"})["getInjectionIndexes"]:
+            v = sum(x["v"] for x in (p.get("c") or []) if x.get("v") is not None)
+            if any(x.get("v") is not None for x in (p.get("c") or [])):
+                a["jours"][p["d"]] = round(v / 1000, 3)          # Wh -> kWh
+        debut = fin
     a["releve"] = now
 
 
@@ -149,11 +168,21 @@ def bilan(a):
     surplus12 = sum(v["kwh"] for v in douze)
     kwc = a.get("kwc") or config.URBAN_KWC
     abo_ht_mois = 0.0 if surplus12 <= SEUIL_KWH_PAR_KWC * kwc else surplus12 / 500
+    # kWh exacts par mois civil (Enedis journalier) et solde estimé façon site : les mois
+    # postérieurs au dernier mois valorisé comptent au dernier prix connu
+    enedis = {}
+    for j, kwh in a.get("jours", {}).items():
+        enedis[j[:7]] = enedis.get(j[:7], 0) + kwh
+    dernier_valorise = max(valorise) if valorise else ""
+    provisoire = {k: kwh for k, kwh in sorted(enedis.items()) if k > dernier_valorise}
+    estime = solde + sum(provisoire.values()) * (prix.get(dernier) or 0)
     return {
         "solde": solde, "vie": vie, "en_attente": en_attente,
         "dernier_mois": dernier, "dernier_prix": prix.get(dernier),
         "surplus12": surplus12, "nb_mois12": len(douze), "kwc": kwc,
         "abo_ttc_an": abo_ht_mois * 12 * TVA, "mois": mois,
+        "enedis": dict(sorted(enedis.items())), "provisoire": provisoire, "solde_estime": estime,
+        "dernier_jour": max(a.get("jours", {}) or [None]),
     }
 
 
@@ -176,6 +205,15 @@ def pousse_capteurs(a):
     pousse("sensor.urban_solde", round(b["solde"], 2), "€", "Urban Solar solde",
            {**commun, "kwh_en_attente_de_prix": sum(b["en_attente"].values()),
             "mois_en_attente": list(b["en_attente"]), "detail": detail}, "total", "monetary")
+    pousse("sensor.urban_solde_estime", round(b["solde_estime"], 2), "€", "Urban Solar solde estimé",
+           {**commun, "provisoire_kwh": {k: round(v, 1) for k, v in b["provisoire"].items()},
+            "prix_provisoire": b["dernier_prix"],
+            "note": "mois sans prix valorisés au dernier prix connu, comme le tableau du site"}, "total", "monetary")
+    mois_courant = dt.date.today().strftime("%Y-%m")
+    pousse("sensor.urban_injection_mois", round(b["enedis"].get(mois_courant, 0), 2), "kWh",
+           "Urban Solar injection du mois (Enedis)",
+           {**commun, "jusqu_au": b["dernier_jour"], "par_mois": {k: round(v, 1) for k, v in b["enedis"].items()}},
+           "total", "energy")
     pousse("sensor.urban_rachat_vie", round(b["vie"], 2), "€", "Urban Solar rachat valorisé à vie",
            {**commun, "premier_mois": next(iter(b["mois"]), None)}, "total", "monetary")
     if b["dernier_prix"]:
@@ -206,6 +244,8 @@ def rapport(a):
         p = f"{v['prix']*100:6.3f} c" if v["prix"] > 0 else "   à venir"
         print(f"  {k}  {v['kwh']:5} kWh  {p}  {v['kwh']*v['prix']:6.2f} €  {'facturé' if v['facture'] else ''}")
     print(f"  solde {b['solde']:.2f} €   vie {b['vie']:.2f} €   en attente {b['en_attente']}")
+    print("  Enedis journalier :", {k: round(v, 1) for k, v in b["enedis"].items()}, "jusqu'au", b["dernier_jour"])
+    print(f"  solde estimé {b['solde_estime']:.2f} € (provisoire {b['provisoire']} au dernier prix)")
     print(f"  dernier prix {b['dernier_prix']} ({b['dernier_mois']})   "
           f"abonnement estimé {b['abo_ttc_an']:.2f} € TTC/an sur {b['surplus12']} kWh ({b['kwc']} kWc)")
 
