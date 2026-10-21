@@ -431,8 +431,9 @@ template:
       # invente ~50 W d'injection la nuit depuis le Deye), veille des micros ignorée (≤ 15 W),
       # rachat Urban Solar « boost » au prix input_number.prix_rachat_surplus. Le solaire
       # stocké est valorisé au prix de rachat côté panneaux et retranché côté batterie.
-      # MAJ 21/10 : prix de rachat NET de l'abonnement Boost (input_number.cout_abonnement_rachat,
-      # 0,0288 €/kWh tenu par urbansolar/urban_archive.py) ; les deux réglages suivent le service.
+      # MAJ 21/10 : abonnement Boost compté comme Urban le facture, en charge horaire
+      # (sensor.urban_abonnement_estime / 8760, sur le rachat et les panneaux) ; la batterie garde le
+      # coût marginal par kWh stocké (input_number.cout_abonnement_rachat) : stocker réduit le surplus annuel.
       - name: "Économie solaire live"
         unique_id: economie_solaire_live
         unit_of_measurement: "€/h"
@@ -448,12 +449,13 @@ template:
           {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
                          else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
           {% set pi = states('input_number.prix_rachat_surplus') | float(0) %}
-          {% set pi = pi - states('input_number.cout_abonnement_rachat') | float(0) %}
+          {% set abo_kwh = states('input_number.cout_abonnement_rachat') | float(0) %}
+          {% set abo_h = states('sensor.urban_abonnement_estime') | float(0) / 8760 %}
           {% set conso = [g + p + b, 0] | max %}
           {% set solaire = [p, conso] | min %}
           {% set stocke = [[0 - b, 0] | max, [p - solaire, 0] | max] | min %}
           {% set export = [0 - g, 0] | max %}
-          {{ ((solaire * tarif + (export + stocke) * pi) / 1000) | round(4) }}
+          {{ ((solaire * tarif + export * pi + stocke * (pi - abo_kwh)) / 1000 - abo_h) | round(4) }}
 
       - name: "Économie batterie live"
         unique_id: economie_batterie_live
@@ -470,12 +472,13 @@ template:
           {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
                          else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
           {% set pi = states('input_number.prix_rachat_surplus') | float(0) %}
-          {% set pi = pi - states('input_number.cout_abonnement_rachat') | float(0) %}
+          {% set abo_kwh = states('input_number.cout_abonnement_rachat') | float(0) %}
+          {% set abo_h = states('sensor.urban_abonnement_estime') | float(0) / 8760 %}
           {% set conso = [g + p + b, 0] | max %}
           {% set solaire = [p, conso] | min %}
           {% set stocke = [[0 - b, 0] | max, [p - solaire, 0] | max] | min %}
           {% set export = [0 - g, 0] | max %}
-          {{ (((conso - ([g, 0] | max) - solaire) * tarif - stocke * pi) / 1000) | round(4) }}
+          {{ (((conso - ([g, 0] | max) - solaire) * tarif - stocke * (pi - abo_kwh)) / 1000) | round(4) }}
 
       # Méthode Urban Solar : montant = kWh injectés × prix du mois (indice CRE × coefficient USE)
       - name: "Rachat surplus live"
@@ -493,12 +496,13 @@ template:
           {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
                          else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
           {% set pi = states('input_number.prix_rachat_surplus') | float(0) %}
-          {% set pi = pi - states('input_number.cout_abonnement_rachat') | float(0) %}
+          {% set abo_kwh = states('input_number.cout_abonnement_rachat') | float(0) %}
+          {% set abo_h = states('sensor.urban_abonnement_estime') | float(0) / 8760 %}
           {% set conso = [g + p + b, 0] | max %}
           {% set solaire = [p, conso] | min %}
           {% set stocke = [[0 - b, 0] | max, [p - solaire, 0] | max] | min %}
           {% set export = [0 - g, 0] | max %}
-          {{ (export * pi / 1000) | round(4) }}
+          {{ (export * pi / 1000 - abo_h) | round(4) }}
 
       - name: "Économie totale cumul"
         unique_id: economie_totale_cumul
