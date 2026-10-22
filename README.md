@@ -77,8 +77,8 @@ Two recurring missions run under every mode:
 |--------|-------------|-----------------|---------|
 | `input_select.ems_mode` | Active mode (see [Modes](#modes--states)) | 4 options | `SOLAR_ONLY` |
 | `input_number.batt_charge_limit` | Max SOC the battery is allowed to charge to | 50 – 100 % | 80 % |
-| `input_number.batt_charge_prio` | SOC target reached before solar surplus goes to the EV | 0 – 100 % | auto |
-| `input_number.discharge_limit` | SOC floor — battery won't discharge for the EV below this | 10 – 100 % | auto |
+| `input_number.batt_charge_prio` | SOC target reached before solar surplus goes to the EV | 10 – 100 % | manual |
+| `input_number.discharge_limit` | SOC floor — battery won't discharge for the EV below this | 10 – 100 % | manual |
 
 ### Status Outputs (written by the script, for dashboards)
 
@@ -87,7 +87,7 @@ Two recurring missions run under every mode:
 | `input_number.grid_ratio_value` | Share of EV power currently drawn from the grid (%) |
 | `input_number.range_needed_over_night` | Measured overnight battery drain (%), auto-computed |
 
-> `batt_charge_prio` and `discharge_limit` are also **auto-set** each morning by the [overnight range tracker](#overnight-range-tracking); the user can override them at any time.
+> `batt_charge_prio` and `discharge_limit` are set **by hand only**: the EMS reads them and never writes them. `range_needed_over_night` is there to help choose them.
 
 ---
 
@@ -491,21 +491,10 @@ EMA-smoothed like the discharge limiter. At equilibrium the battery covers `(1 �
 
 ### Overnight Range Tracking
 
-Two-phase state machine that measures how much the battery drains overnight and pre-sets the next day's floor/priority:
+Two-phase state machine that measures how much the battery drains overnight. Information only: it no longer sets `discharge_limit` or `batt_charge_prio` (manual since 2026-10-22).
 
 - **WAIT_FOR_NIGHT** — on the falling edge of solar (dusk), capture `soc_dusk`. Later edges overwrite it, so the last crossing before 01:00 is the real sunset. At 01:00, lock it in.
-- **WAIT_FOR_DAYLIGHT** — on the first solar crossing above 100 W (sunrise), compute `range_needed = soc_dusk − soc_now`, then set:
-  - `range_needed_over_night = range_needed`
-  - `discharge_limit = target = min(MIN_SOC_LFP(20) + range_needed + SAFETY_MARGIN(10), 100)`
-  - `batt_charge_prio = MORNING_BATT_CHARGE_PRIO (25)`, then `target` at 12:24 (`BATT_PRIO_RELEASE_AT`)
-
-This keeps enough charge for the following night without over-charging.
-
-**Deferred `batt_charge_prio`.** Octopus refunds EV kWh at the current tariff (HP refund > HC refund), so in the morning the solar surplus goes to the car first: the prio stays low until the midday off-peak window (12:24–15:24), when the battery is recharged. Rules:
-- applied every day, whatever the mode (the prio only matters in the SOLAR modes);
-- if `target ≤ 25`, or sunrise happens after 12:24, `target` is written at once;
-- if the prio is no longer 25 at 12:24 (changed by hand), it is left alone;
-- the pending target is persisted in `logs/ems_state.json`: a restart after 12:24, or on a later day, applies it at once.
+- **WAIT_FOR_DAYLIGHT** — on the first solar crossing above 100 W (sunrise), compute `range_needed = soc_dusk − soc_now` and publish it to `range_needed_over_night`.
 
 ### Wallbox Override Protection
 
@@ -526,7 +515,7 @@ Wallbox_Deye_HA_EMS/
 ├── ems.py                    # EMS logic: state machine, algorithms, main loop
 └── logs/                     # Log directory (not committed)
     ├── ems.log               # Log of each wallbox/battery adjustment
-    └── ems_state.json        # Persisted state (Tesla solar pause flag, deferred batt_charge_prio)
+    └── ems_state.json        # Persisted state (Tesla solar pause flag, overnight tracking)
 ```
 
 ---
@@ -606,7 +595,7 @@ nano config.py      # Fill in HA IP + token
 #   input_select.ems_mode  → options: SOLAR_ONLY, SOLAR_BOOSTED, FULL_SPEED,
 #                            STORAGE_ONLY
 #   input_number.batt_charge_limit   (50–100 %, step 5, default 80)
-#   input_number.batt_charge_prio    (0–100 %)
+#   input_number.batt_charge_prio    (10–100 %)
 #   input_number.discharge_limit     (10–100 %)
 #   input_number.grid_ratio_value    (status display, 0–100 %)
 #   input_number.range_needed_over_night (status display, 0–100 %)
