@@ -1,0 +1,14 @@
+[Unit]
+Description=Calcul horaire de l'économie de carburant
+
+[Timer]
+# Horaire : les capteurs REST disparaissent au redémarrage de HA, et les
+# recharges de l'Ioniq hors de la maison sont repérées sur une fenêtre de 48 h.
+OnCalendar=hourly
+OnBootSec=6min
+RandomizedDelaySec=2m
+Persistent=false
+Unit=carburant.service
+
+[Install]
+WantedBy=timers.target

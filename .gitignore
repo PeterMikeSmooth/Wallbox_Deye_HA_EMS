@@ -225,3 +225,6 @@ chutes/data/
 
 # Relevés Urban Solar : données de compte, jamais sur GitHub
 urbansolar/data/
+
+# Économie carburant : sessions de recharge horodatées, jamais sur GitHub
+voitures/data/
