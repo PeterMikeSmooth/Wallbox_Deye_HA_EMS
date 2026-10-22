@@ -48,3 +48,7 @@ URBAN_EMAIL = ""                  # adresse de connexion à espace-client.urbans
 URBAN_PASSWORD = ""               # mot de passe (config.py est gitignoré, ne jamais le commiter)
 URBAN_PDL = "00000000000000"      # n° de PDL, celui de l'URL /pdl/<PDL>/mon-surplus
 URBAN_KWC = 3.0                   # puissance déclarée chez Urban Solar (seuil de gratuité de l'abonnement)
+
+
+# Tessie (Tesla) — jeton API (tessie.com > Settings > API), lu par le service carburant
+TESSIE_TOKEN = ""                 # config.py est gitignoré, ne jamais le commiter
