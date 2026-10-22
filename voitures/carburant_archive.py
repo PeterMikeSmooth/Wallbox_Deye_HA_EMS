@@ -14,8 +14,10 @@ Hypothèses (validées par l'utilisateur le 22/10/2026) :
     dans les voitures est déjà compté dans les économies des panneaux ;
   - Ioniq avant le Shelly (déc. 2022 → oct. 2023) : 5,4 kWh maison / 100 km ;
   - Tesla jusqu'au 21/10/2026 : chiffres annuels de l'utilisateur ; ensuite
-    capteurs sensor.voiture_branchee_* (EMS) et, quand TESSIE_TOKEN est
-    renseigné, les sessions Tessie (superchargeurs, travail).
+    capteurs sensor.voiture_branchee_* (EMS) pour la maison et sessions Tessie
+    (coût réel des superchargeurs ; autres recharges hors maison = gratuites).
+    Tessie ne connaît la voiture que depuis le 19/02/2026 ; ses relevés
+    d'odomètre remplacent l'estimation des km par kWh.
 
 Usage :
     python3 carburant_archive.py              calcule et publie
@@ -34,6 +36,8 @@ DATA = os.path.join(BASE, "data")
 os.makedirs(DATA, exist_ok=True)
 ARCHIVE = os.path.join(DATA, "carburant.json")
 HA = {"Authorization": "Bearer " + config.HA_TOKEN, "Content-Type": "application/json"}
+TESSIE = "https://api.tessie.com"
+MAISON_TESSIE = "477 Chemin"                 # début du lieu enregistré « maison » dans Tessie
 TZ = dt.datetime.now().astimezone().tzinfo
 
 INSEE = "https://bdm.insee.fr/series/sdmx/data/SERIES_BDM/010596132?startPeriod=2022-12"
@@ -138,7 +142,12 @@ def odometre_journalier(voiture, aujourd_hui):
         pts.append((aujourd_hui, float(etat(ODO[voiture])["state"])))
     except (KeyError, ValueError):
         pass
-    if voiture == "tesla":                           # trou 02/2025 → 08/2026 : répartition par kWh
+    if voiture == "tesla":
+        par_jour = {}
+        for x in (TESSIE_SESSIONS or {}).values():       # relevés d'odomètre de chaque session
+            par_jour[dt.datetime.fromtimestamp(x["t"], TZ).date()] = x["odo"]
+        pts += [(d, km) for d, km in par_jour.items() if d <= aujourd_hui]
+    if voiture == "tesla" and not TESSIE_SESSIONS:   # sans Tessie : trou 02/2025 → 08/2026 réparti par kWh
         dernier = max(p[1] for p in pts)
         connu = min((p for p in pts if p[0] > d0), key=lambda p: p[0], default=None)
         if connu:
@@ -237,6 +246,30 @@ def recharges_ioniq_dehors(a):
                             "kwh": round(gain / 100 * cap / rdt, 2), "lieu": a_t(lieu, debut)}
 
 
+TESSIE_SESSIONS = None
+
+
+def tessie(a):
+    """Sessions de recharge de la Tesla (archivées : Tessie ne remonte qu'au 19/02/2026)."""
+    global TESSIE_SESSIONS
+    a.setdefault("tessie", {})
+    jeton = getattr(config, "TESSIE_TOKEN", "")
+    if jeton:
+        try:
+            H = {"Authorization": "Bearer " + jeton}
+            vin = requests.get(TESSIE + "/vehicles", headers=H, params={"only_active": "true"}, timeout=30).json()["results"][0]["vin"]
+            depuis = max([x["t"] for x in a["tessie"].values()] or [1735689600]) - 7 * 86400
+            for s in requests.get(f"{TESSIE}/{vin}/charges", headers=H, timeout=90, params={
+                    "distance_format": "km", "format": "json", "from": int(depuis)}).json().get("results", []):
+                a["tessie"][str(s["id"])] = {
+                    "t": s["started_at"], "odo": s.get("odometer"), "sc": bool(s.get("is_supercharger")),
+                    "rapide": bool(s.get("is_fast_charger")), "maison": (s.get("saved_location") or "").startswith(MAISON_TESSIE),
+                    "kwh": s.get("energy_used") or s.get("energy_added") or 0, "cout": s.get("cost") or 0}
+        except Exception as e:
+            print(f"  Tessie : {e}")
+    TESSIE_SESSIONS = {k: v for k, v in a["tessie"].items() if v.get("odo")}
+
+
 # ---------------------------------------------------------------- calcul
 def calcule(a):
     auj = dt.date.today()
@@ -282,6 +315,14 @@ def calcule(a):
     while d < SHELLY_DEBUT:                          # avant le Shelly
         ajoute("ioniq", d, "maison_kwh", jours.get(("ioniq", d), {}).get("km", 0) * IONIQ_MAISON_KWH_KM)
         d += dt.timedelta(days=1)
+    for x in a.get("tessie", {}).values():           # Tesla après la coupure : sessions Tessie hors maison
+        d = dt.datetime.fromtimestamp(x["t"], TZ).date()
+        if d < COUPURE or x["maison"]:
+            continue
+        if x["sc"]:
+            ajoute("tesla", d, "super_eur", x["cout"])
+        else:
+            ajoute("tesla", d, "gratuit_kwh", x["kwh"])
     for s in a.get("ioniq_dehors", {}).values():     # recharges gratuites détectées
         ajoute("ioniq", dt.datetime.fromisoformat(s["fin"]).date(), "gratuit_kwh", s["kwh"])
     for (v, d), x in jours.items():
@@ -356,6 +397,7 @@ def main():
     ap.add_argument("--rapport", action="store_true")
     o = ap.parse_args()
     a = json.load(open(ARCHIVE)) if os.path.exists(ARCHIVE) else {}
+    tessie(a)
     try:
         recharges_ioniq_dehors(a)
     except Exception:
