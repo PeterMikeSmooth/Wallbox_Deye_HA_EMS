@@ -1463,6 +1463,11 @@ class EMS:
                "MID safety margin exceeded")
 
     @classmethod
+    def _gw_label_names_car(cls, label: str | None) -> bool:
+        """Does sensor.wallbox_192_168_8_188_charger_status name a car?"""
+        return label in cls._GW_CAR or (label or "").startswith("Connected")
+
+    @classmethod
     def _car_plugged(cls, s: dict) -> bool | None:
         """Is a car plugged in?  ``None`` when the answer is not conclusive.
 
@@ -1489,7 +1494,7 @@ class EMS:
         """
         label = s.get("gw_charger_status")
         flag = s.get("gw_car_connected")
-        if flag == "on" or label in cls._GW_CAR or (label or "").startswith("Connected"):
+        if flag == "on" or cls._gw_label_names_car(label):
             return True
         if flag == "off" and label in cls._GW_NO_CAR:
             return False
@@ -1666,10 +1671,25 @@ class EMS:
             plugged = self._car_plugged_cloud(s)
             status = (f"cloud: {s.get('wallbox_status')!r}, "
                       f"{s['ev_power']:.0f} W — gateway {gw_status!r}")
-        # Tesla session: take the car's own word, without waiting for the
-        # gateway to make up its mind — see _tesla_cable_says_unplugged().
+        # Tesla session: the car's own word, but never against a charger that
+        # still names a car.  On 2026-10-23 18:47:23 Tessie dropped
+        # binary_sensor.martine_charge_cable to 'off' for 60 s with the cable
+        # in — together with lock.martine_charge_cable_lock and
+        # sensor.martine_charging, so the whole source was wrong — while
+        # sensor.wallbox_192_168_8_188_charger_status read 'OCPP charge
+        # finishing' and cover.martine_charge_port_door stayed 'open'.
+        # input_select.ems_mode was reset and had to be set again by hand.
+        #
+        # The guard costs this witness almost all of its use: over 10 885
+        # samples since 10-11, the label failed to name a car while
+        # binary_sensor.wallbox_192_168_8_188_car_connected still read 'on'
+        # nine times, all of them plug-in transients.  Detection therefore
+        # falls back to the gateway, 15-23 s instead of 4 s — the trade the
+        # user accepted on 2026-10-23, since input_select.ems_mode is only
+        # consumed by the next session while a wrong reset costs a mode.
         if (plugged is True and self._car_connected is True
                 and self._ev_label == EV_TESLA
+                and not self._gw_label_names_car(gw_status)
                 and self._tesla_cable_says_unplugged()):
             log.info("Tesla reports its cable out — unplug confirmed ahead of "
                      "the gateway (flag=%r label=%r)",
