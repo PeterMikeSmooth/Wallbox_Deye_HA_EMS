@@ -43,6 +43,7 @@ TZ = dt.datetime.now().astimezone().tzinfo
 INSEE = "https://bdm.insee.fr/series/sdmx/data/SERIES_BDM/010596132?startPeriod=2022-12"
 L100 = {"ioniq": 6.0, "tesla": 7.0}
 BORNE = 1200.0
+PRIX = {"ioniq": 23000.0 + BORNE / 2, "tesla": 35000.0 + BORNE / 2}   # base du ROI (borne partagée)
 
 ACHAT = {"ioniq": (dt.date(2022, 12, 15), 18000.0), "tesla": (dt.date(2025, 2, 14), 109000.0)}
 ODO = {"ioniq": "sensor.moniq_odometer", "tesla": "sensor.martine_odometer"}
@@ -377,6 +378,17 @@ def publie(jours):
         if nom == "vie":
             pousse("sensor.economie_carburant_nette_vie", r(tot["economie"] - BORNE), "Économie carburant nette (borne déduite)",
                    {"borne": BORNE})
+    # ROI : économie des 365 derniers jours / (prix d'achat + moitié de la borne)
+    par, _ = somme(jours, lambda d: auj - dt.timedelta(days=365) < d <= auj)
+    for v, x in par.items():
+        eco = x.get("economie", 0)
+        try:
+            requests.post(config.HA_URL + f"/api/states/sensor.roi_{v}", headers=HA, timeout=20, json={
+                "state": round(100 * eco / PRIX[v], 1), "attributes": {
+                    "unit_of_measurement": "%", "state_class": "measurement", "friendly_name": f"ROI {v.capitalize()}",
+                    "icon": "mdi:finance", "economie_365j": r(eco), "base": PRIX[v], "km_365j": round(x.get("km", 0))}})
+        except Exception as e:
+            print(f"  roi {v} : {e}")
     return somme(jours, lambda d: True)
 
 
