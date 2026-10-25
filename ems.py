@@ -1318,10 +1318,17 @@ class EMS:
         the 20:48:41 unplug that night the flag only dropped at 20:48:56 and
         ev_connected followed at 20:49:04, 23 s after the cable.
 
-        The cable sensor is a genuine cable sensor, not a power proxy: it held
-        through the five charge pauses of the 09-11 night, where anything
-        current-based (the Shelly, the Ioniq's OBD dongle) would have reported
-        an unplug at each one.
+        Two entities, because binary_sensor.martine_charge_cable follows the
+        *latch* and the car cannot tell "unlatched" from "removed": the charger
+        releases the latch with the cable still in, at the end of a session and
+        right through a firmware update, and the sensor then reads 'off' for
+        about a minute.  cover.martine_charge_port_door only closes once the
+        plug is physically out — 16 real unplugs closed it within 0-30 s
+        (2026-10-18..25), 6 latch releases left it open.
+
+        Neither is power-based, which matters: the cable held through the five
+        charge pauses of the 09-11 night, where the Shelly or the Ioniq's OBD
+        dongle would have reported an unplug at each one.
 
         Polled every TESLA_CABLE_POLL_S rather than every tick, and only while
         the Tesla is the car on the cable, so the Tesla entities stay out of
@@ -1332,9 +1339,20 @@ class EMS:
         if now - self._tesla_cable_ts >= TESLA_CABLE_POLL_S:
             self._tesla_cable_ts = now
             try:
-                self._tesla_cable_off = self.ha.read_tesla_cable() == "off"
+                cable = self.ha.read_tesla_cable()
+                door = self.ha.read_tesla_charge_port_door()
+                self._tesla_cable_off = cable == "off" and door == "closed"
+                if cable == "off" and door == "open":
+                    log.info("binary_sensor.martine_charge_cable reads 'off' but "
+                             "cover.martine_charge_port_door is still open — the "
+                             "charger released the latch, the cable is still in")
+                elif cable == "off" and door != "closed":
+                    log.info("binary_sensor.martine_charge_cable reads 'off' and "
+                             "cover.martine_charge_port_door reads %r — no verdict, "
+                             "session kept", door)
             except Exception:
-                log.warning("Could not read the Tesla cable sensor", exc_info=True)
+                log.warning("Could not read the Tesla cable and port door",
+                            exc_info=True)
                 self._tesla_cable_off = False
         # The answer is cached between polls, not withheld: an edge has to be
         # read on two consecutive ticks, so returning False while throttled
@@ -1687,25 +1705,17 @@ class EMS:
             plugged = self._car_plugged_cloud(s)
             status = (f"cloud: {s.get('wallbox_status')!r}, "
                       f"{s['ev_power']:.0f} W — gateway {gw_status!r}")
-        # Tesla session: the car's own word, but never against a charger that
-        # still names a car.  On 2026-10-23 18:47:23 Tessie dropped
-        # binary_sensor.martine_charge_cable to 'off' for 60 s with the cable
-        # in — together with lock.martine_charge_cable_lock and
-        # sensor.martine_charging, so the whole source was wrong — while
-        # sensor.wallbox_192_168_8_188_charger_status read 'OCPP charge
-        # finishing' and cover.martine_charge_port_door stayed 'open'.
-        # input_select.ems_mode was reset and had to be set again by hand.
-        #
-        # The guard costs this witness almost all of its use: over 10 885
-        # samples since 10-11, the label failed to name a car while
-        # binary_sensor.wallbox_192_168_8_188_car_connected still read 'on'
-        # nine times, all of them plug-in transients.  Detection therefore
-        # falls back to the gateway, 15-23 s instead of 4 s — the trade the
-        # user accepted on 2026-10-23, since input_select.ems_mode is only
-        # consumed by the next session while a wrong reset costs a mode.
+        # Tesla session: the car's own word, now that it takes two entities to
+        # say it — see _tesla_cable_says_unplugged().  This replaces the guard
+        # added on 10-23, which demanded that
+        # sensor.wallbox_192_168_8_188_charger_status stop naming a car and so
+        # left the witness nearly inert: over 10 885 samples since 10-11 that
+        # window opened nine times, all of them plug-in transients.  The port
+        # door blocks the same false unplugs — it stayed 'open' through every
+        # latch release — while letting a real one through in 0 to 12 s
+        # instead of the gateway's 15 to 23 s.
         if (plugged is True and self._car_connected is True
                 and self._ev_label == EV_TESLA
-                and not self._gw_label_names_car(gw_status)
                 and self._tesla_cable_says_unplugged()):
             log.info("Tesla reports its cable out — unplug confirmed ahead of "
                      "the gateway (flag=%r label=%r)",
