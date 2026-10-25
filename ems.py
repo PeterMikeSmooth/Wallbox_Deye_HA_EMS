@@ -1376,12 +1376,28 @@ class EMS:
         label = self._ev_label
         if label == EV_TESLA:
             cable = self.ha.read_tesla_cable()
-            if cable == "on":
-                log.info("Gateway announces a new session (%r) but the Tesla's cable "
-                         "is still plugged — session kept", GW_NEW_SESSION)
+            door = self.ha.read_tesla_charge_port_door()
+            # binary_sensor.martine_charge_cable alone is not enough here: it
+            # follows the latch, and the charger releases the latch with the
+            # cable still in — at the end of a session and throughout a
+            # charger firmware update.  On 2026-10-25 at 14:04:09 that read
+            # "off" for 60 s while sensor.wallbox_192_168_8_188_charger_status
+            # had just announced a new session, and this check closed the
+            # session and reset input_select.ems_mode on a Tesla that had
+            # never moved.  cover.martine_charge_port_door separates the two:
+            # 16 real unplugs closed it within 0-30 s, 6 latch releases left
+            # it open.  And it closes well before the marker arrives — 27 s
+            # ahead on the real swap of 10-15 17:33 — so requiring it costs
+            # nothing here.
+            if cable == "on" or door != "closed":
+                log.info("Gateway announces a new session (%r) but the Tesla still "
+                         "holds the cable (binary_sensor.martine_charge_cable=%r, "
+                         "cover.martine_charge_port_door=%r) — session kept",
+                         GW_NEW_SESSION, cable, door)
                 return
-            log.info("Gateway announces a new session (%r) and the Tesla's cable reads %r "
-                     "— treating it as a swap", GW_NEW_SESSION, cable)
+            log.info("Gateway announces a new session (%r), the Tesla's cable reads %r "
+                     "and its port door is closed — treating it as a swap",
+                     GW_NEW_SESSION, cable)
             self._close_session_for_swap(s)
         elif label in (EV_IONIQ, EV_UNKNOWN):
             if self._swap_check_running:

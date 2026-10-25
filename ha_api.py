@@ -26,6 +26,7 @@ INPUT_RANGE_NEEDED = "input_number.range_needed_over_night"
 TESLA_LOCATION = "device_tracker.martine_location"        # "home" when parked at home
 TESLA_CHARGING = "sensor.martine_charging"                # starting|charging|stopped|complete|disconnected|no_power
 TESLA_CHARGE_CABLE = "binary_sensor.martine_charge_cable"  # "on" = cable plugged in
+TESLA_CHARGE_PORT_DOOR = "cover.martine_charge_port_door"  # "closed" = the plug really left
 SWITCH_TESLA_CHARGE = "switch.martine_charge"             # on = car allowed to charge
 
 # Hyundai Ioniq (Kia Uvo / Bluelink integration, device "MONIQ") — used to
@@ -222,6 +223,19 @@ class HomeAssistantAPI:
         except ValueError:
             return None
         return (datetime.now(when.tzinfo) - when).total_seconds()
+
+    def read_tesla_charge_port_door(self) -> str | None:
+        """The Tesla's charge port flap: "closed" means the plug really left.
+
+        binary_sensor.martine_charge_cable follows the *latch*, and the car
+        cannot tell "unlatched" from "removed": every time the charger
+        releases the lock with the cable still in, it reads "off" for about a
+        minute.  The flap does not move in that case — it only closes once the
+        plug is physically out.  Measured over 18-25 October: 16 real unplugs,
+        the flap closed on all of them within 0 to 30 s, and 6 latch releases
+        with the cable in, where it stayed "open" every time.
+        """
+        return self.get_text_state_safe(TESLA_CHARGE_PORT_DOOR)
 
     def read_tesla_cable(self) -> str | None:
         """Just the Tesla's cable sensor, not the whole bundle.
