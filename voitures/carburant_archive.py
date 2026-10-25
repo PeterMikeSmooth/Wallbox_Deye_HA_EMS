@@ -25,6 +25,7 @@ Usage :
 """
 import os, sys, json, re, asyncio, argparse, bisect, traceback
 import datetime as dt
+from zoneinfo import ZoneInfo
 import requests, websockets
 
 BASE = os.path.dirname(os.path.abspath(__file__))       # .../voitures
@@ -38,7 +39,7 @@ ARCHIVE = os.path.join(DATA, "carburant.json")
 HA = {"Authorization": "Bearer " + config.HA_TOKEN, "Content-Type": "application/json"}
 TESSIE = "https://api.tessie.com"
 MAISON_TESSIE = "477 Chemin"                 # début du lieu enregistré « maison » dans Tessie
-TZ = dt.datetime.now().astimezone().tzinfo
+TZ = ZoneInfo("Europe/Paris")   # pas l'offset courant : il change à chaque heure d'été/hiver (bug du 25/10/2026)
 
 INSEE = "https://bdm.insee.fr/series/sdmx/data/SERIES_BDM/010596132?startPeriod=2022-12"
 L100 = {"ioniq": 6.0, "tesla": 7.0}
