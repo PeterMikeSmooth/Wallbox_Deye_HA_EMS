@@ -135,6 +135,9 @@ def gw_label_absent(label: str | None) -> bool:
 
 TESLA_CABLE_GRACE_S = 30         # Tessie's cable usually beats the wallbox by
 TESLA_CABLE_POLL_S = 3           # 6-36 s, but trailed it by 4.5 s on 2026-10-06
+TESLA_DOOR_FRESH_S = 120         # how recently cover.martine_charge_port_door
+                                 # must have opened to vouch for this plug
+TESLA_DOOR_GRACE_S = 90          # extra wait it buys the cable sensor
 IONIQ_REFRESH_TIMEOUT_S = 60     # wait for the payload after force_update returns
 IONIQ_REFRESH_POLL_S = 3         # how often to look while waiting
 IONIQ_MAX_DATA_AGE_S = 120       # a payload older than this is not trusted
@@ -972,14 +975,21 @@ class EMS:
         # on 2026-10-06 it trailed it by 4.5 s and the Tesla was published as
         # "other connected".  So give it a short grace before waking the Ioniq
         # — a needless force_update costs a Bluelink request and a car wake-up.
-        deadline = time.monotonic() + TESLA_CABLE_GRACE_S
+        started = time.monotonic()
+        deadline = started + TESLA_CABLE_GRACE_S
+        door_extended = False
         while True:
             if self._tesla_on_cable(ha):
                 return EV_TESLA
-            if time.monotonic() >= deadline or generation != self._ev_id_generation:
+            if generation != self._ev_id_generation:
                 break
+            if time.monotonic() >= deadline:
+                if door_extended or not self._tesla_port_door_vouches(ha):
+                    break
+                door_extended = True
+                deadline = time.monotonic() + TESLA_DOOR_GRACE_S
             time.sleep(TESLA_CABLE_POLL_S)
-        self._tesla_on_cable(ha, log_miss=True)
+        self._tesla_on_cable(ha, log_miss=True, waited=time.monotonic() - started)
 
         # 2. Ioniq — its own OBD dongle first.  An Ioniq just put on the cable
         # is awake and answers in 3-6 s (5 plug-ins out of 5); one asleep
@@ -1023,16 +1033,43 @@ class EMS:
         return label
 
     @staticmethod
-    def _tesla_on_cable(ha: HomeAssistantAPI, log_miss: bool = False) -> bool:
+    def _tesla_on_cable(ha: HomeAssistantAPI, log_miss: bool = False,
+                        waited: float = TESLA_CABLE_GRACE_S) -> bool:
         tesla = ha.read_tesla_state()
         cable = ha_text(tesla, "tesla_charge_cable")
         location = ha_text(tesla, "tesla_location")
         if cable == "on" and location == "home":
             return True
         if log_miss:
-            log.info("EV id: not the Tesla after %d s (cable=%r location=%r)",
-                     TESLA_CABLE_GRACE_S, cable, location)
+            log.info("EV id: not the Tesla after %.0f s (cable=%r location=%r)",
+                     waited, cable, location)
         return False
+
+    @staticmethod
+    def _tesla_port_door_vouches(ha: HomeAssistantAPI) -> bool:
+        """Is cover.martine_charge_port_door evidence the cable sensor is late?
+
+        On 2026-10-29 the Tesla was re-plugged at about 08:32:45.  The flap
+        opened at 08:32:40, 15 s before the gateway itself saw the plug, and
+        binary_sensor.martine_charge_cable only followed at 08:34:00 — 32 s
+        after the 30 s grace had run out.  The Tesla was ruled out, the Ioniq
+        fallback took over, and input_text.ev_connected read "Ioniq connected"
+        from 08:34:26 to 08:38:43 while the Tesla charged.  The flap was the
+        fastest of the three witnesses, so when it has just opened, wait for
+        the cable rather than give up on the car.
+
+        "Just opened" is the whole point: the house has a second charging
+        point, and a flap that has been open for a while says nothing about
+        which car is on the wallbox.  So this only ever buys the cable sensor
+        more time — the verdict still comes from the cable.
+        """
+        state, age = ha.read_tesla_charge_port_door_dated()
+        if state != "open" or age is None or age > TESLA_DOOR_FRESH_S:
+            return False
+        log.info("EV id: binary_sensor.martine_charge_cable still reads 'off', "
+                 "but cover.martine_charge_port_door opened %.0f s ago — "
+                 "giving the cable another %d s", age, TESLA_DOOR_GRACE_S)
+        return True
 
     def _ioniq_present_despite_silence(self, ha: HomeAssistantAPI,
                                        generation: int) -> str:
@@ -1048,7 +1085,7 @@ class EMS:
            answer that makes this another car.  No answer at all, or an
            unknown location, leaves the Ioniq as the conclusion.
         """
-        age = ha.read_ioniq_ble_contact_age_s()
+        age = ha.read_ioniq_ble_contact_age_s(IONIQ_BLE_FRESH_S)
         if age is not None and age <= IONIQ_BLE_FRESH_S:
             log.info("EV id: dongle silent but its BLE link to the car was "
                      "reported %.0f s ago — the Ioniq is here", age)

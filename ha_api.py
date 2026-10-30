@@ -2,7 +2,7 @@
 
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,9 @@ GW_CHARGER_STATUS = "sensor.wallbox_192_168_8_188_charger_status"
 
 class HomeAssistantAPI:
     """Thin wrapper around the HA REST API."""
+
+    # What Home Assistant publishes when an entity has no reading at all.
+    _NO_STATE = (None, "", "unavailable", "unknown")
 
     def __init__(self, url: str, token: str):
         self._base = url.rstrip("/")
@@ -202,7 +205,44 @@ class HomeAssistantAPI:
         )
         resp.raise_for_status()
 
-    def read_ioniq_ble_contact_age_s(self) -> float | None:
+    @staticmethod
+    def _age_s(entity: dict, key: str = "last_changed") -> float | None:
+        """Seconds since ``entity``'s ``key`` timestamp, or None if unusable."""
+        stamp = entity.get(key) or entity.get("last_updated")
+        if not stamp:
+            return None
+        try:
+            when = datetime.fromisoformat(stamp)
+        except ValueError:
+            return None
+        return (datetime.now(when.tzinfo) - when).total_seconds()
+
+    def _recent_history(self, entity_id: str, seconds: float) -> list[dict]:
+        """The entity's recent states, oldest first; [] when unreadable.
+
+        Callers must read [] as "no information", never as "nothing
+        happened".  ``end_time`` is not optional: without it Home Assistant
+        silently truncates the answer to 24 h.
+        """
+        now = datetime.now().astimezone()
+        try:
+            resp = self._session.get(
+                f"{self._base}/api/history/period/"
+                f"{(now - timedelta(seconds=seconds)).isoformat()}",
+                params={"filter_entity_id": entity_id,
+                        "end_time": now.isoformat(),
+                        "minimal_response": ""},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            series = resp.json()
+        except Exception:
+            logger.warning("Could not read the history of %s", entity_id,
+                           exc_info=True)
+            return []
+        return series[0] if series else []
+
+    def read_ioniq_ble_contact_age_s(self, fresh_s: float) -> float | None:
         """Seconds since the OBD gateway last reported the BLE link to the car.
 
         A *fresh* report means the car is within BLE range of the gateway,
@@ -211,18 +251,57 @@ class HomeAssistantAPI:
         been reported for 3 h 45, while the same gateway's uptime and WiFi
         RSSI were 0.3 min old — the link had simply stopped, and -98 was the
         last reading before it did.  Hence the age, not the level.
+
+        But a report is not always a reading.  On 2026-10-29 at 08:30:36
+        sensor.moniq_obd_bluetooth_rssi went "unavailable" and came straight
+        back to the same -71 dBm — the integration reconnecting and replaying
+        its retained value, with sensor.moniq_obd_dernier_releve_bms still
+        four days old.  230 s later the EMS took that for a fresh contact and
+        published "Ioniq connected" while the Tesla was charging.  A value
+        that comes back unchanged measured nothing, so reports like it are
+        skipped and the age is that of the last report that did carry a
+        reading.
+
+        ``fresh_s`` is the caller's own freshness threshold: above it the age
+        already settles the question, and no history is fetched.
         """
         entity = self.get_entity_safe(IONIQ_OBD_BLE_RSSI)
         if not entity:
             return None
-        stamp = entity.get("last_reported") or entity.get("last_updated")
-        if not stamp:
-            return None
-        try:
-            when = datetime.fromisoformat(stamp)
-        except ValueError:
-            return None
-        return (datetime.now(when.tzinfo) - when).total_seconds()
+        age = self._age_s(entity, "last_reported")
+        if age is None or age > fresh_s:
+            return age
+        return self._ble_reading_age_s(age, fresh_s)
+
+    def _ble_reading_age_s(self, age: float, fresh_s: float) -> float:
+        """Date the newest BLE report that carried a reading, not a replay.
+
+        Walks the recent history newest first and skips any value that merely
+        returned, unchanged, from an "unavailable" gap.  ``age`` is handed
+        back untouched when the history cannot be read: a failed request must
+        not manufacture a verdict either way.
+        """
+        window = 3 * fresh_s
+        points = self._recent_history(IONIQ_OBD_BLE_RSSI, window)
+        if not points:
+            return age
+        # The readings only, each keeping its index: a hole between two
+        # consecutive ones means the entity went unavailable in between.
+        readings = [(i, p) for i, p in enumerate(points)
+                    if p.get("state") not in self._NO_STATE]
+        for pos in range(len(readings) - 1, -1, -1):
+            index, point = readings[pos]
+            if pos:
+                before_index, before = readings[pos - 1]
+                if (before_index != index - 1
+                        and before.get("state") == point.get("state")):
+                    continue
+            measured = self._age_s(point)
+            if measured is not None:
+                return measured
+        # Every report in the window was a replay: the last real reading is
+        # older than the window, which is all the caller needs to know.
+        return max(age, window)
 
     def read_tesla_charge_port_door(self) -> str | None:
         """The Tesla's charge port flap: "closed" means the plug really left.
@@ -235,7 +314,21 @@ class HomeAssistantAPI:
         the flap closed on all of them within 0 to 30 s, and 6 latch releases
         with the cable in, where it stayed "open" every time.
         """
-        return self.get_text_state_safe(TESLA_CHARGE_PORT_DOOR)
+        return self.read_tesla_charge_port_door_dated()[0]
+
+    def read_tesla_charge_port_door_dated(self) -> tuple[str | None, float | None]:
+        """The flap's state and how long it has held it, in one read.
+
+        The age is what makes the flap usable as a witness *for* a plug the
+        Tesla's own cable sensor has not reported yet: a flap that opened
+        around the wallbox's plug event belongs to that plug, while one that
+        has been open for an hour says nothing about which car is on the
+        cable — the house has a second charging point.
+        """
+        entity = self.get_entity_safe(TESLA_CHARGE_PORT_DOOR)
+        if not entity:
+            return None, None
+        return entity.get("state"), self._age_s(entity)
 
     def read_tesla_cable(self) -> str | None:
         """Just the Tesla's cable sensor, not the whole bundle.
