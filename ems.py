@@ -67,6 +67,11 @@ DISCHARGE_WRITE_MIN_INTERVAL_S = 10  # min delay between small corrections
 DISCHARGE_LARGE_STEP_A = 5           # a step this big is written immediately
 DISCHARGE_RECONCILE_GRACE_S = 240    # let the inverter reflect a write before judging
 DISCHARGE_RECONCILE_SAMPLES = 2      # consecutive divergent reads before re-writing
+# Phantom SOC: when the Dawnice BMS falls asleep (cell under 3.15 V at rest, no
+# current) the Deye loses its CAN data for ~10 s and reports 99-100 % until it
+# wakes the BMS up again (every ~5 min on 2026-10-30, 01:56-18:11 UTC).
+SOC_GLITCH_JUMP_PCT = 20   # a real SOC never moves this much between two reads
+SOC_GLITCH_HOLD_S = 60     # ...a jump that lasts longer is accepted as real
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +265,8 @@ class EMS:
         self._swap_verdict = None           # (generation, accept) handed back by that thread
         self._last_written_grid_ratio = None
         self._battery_voltage = 52.0        # last known battery voltage
+        self._soc_trusted = None            # last SOC that was not a phantom jump
+        self._soc_jump_since = None         # monotonic ts of the first read of a jump
         # Wallbox override detection
         self._wallbox_override_since = None  # timestamp when override first detected
         self._wallbox_override_retries = 0   # number of toggle retries attempted
@@ -1657,8 +1664,31 @@ class EMS:
 
     # -- per-tick logic -------------------------------------------------------
 
+    def _filter_soc(self, s: dict) -> None:
+        """Hold the last trusted SOC through a phantom jump (see SOC_GLITCH_JUMP_PCT)."""
+        soc = s["battery_soc"]
+        if self._soc_trusted is None or abs(soc - self._soc_trusted) < SOC_GLITCH_JUMP_PCT:
+            if self._soc_jump_since is not None:
+                log.info("SOC jump gone after %.0f s — back to %.0f%%",
+                         time.monotonic() - self._soc_jump_since, soc)
+            self._soc_trusted = soc
+            self._soc_jump_since = None
+            return
+        now = time.monotonic()
+        if self._soc_jump_since is None:
+            self._soc_jump_since = now
+            log.warning("SOC jump %.0f%% → %.0f%% ignored (BMS asleep?)", self._soc_trusted, soc)
+        if now - self._soc_jump_since >= SOC_GLITCH_HOLD_S:
+            log.warning("SOC jump held %d s — accepting %.0f%%", SOC_GLITCH_HOLD_S, soc)
+            self._soc_trusted = soc
+            self._soc_jump_since = None
+            return
+        s["battery_soc"] = self._soc_trusted
+
     def tick(self, s: dict) -> None:
         """Called every fast-loop iteration with fresh sensor data *s*."""
+
+        self._filter_soc(s)
 
         # Update battery voltage for global discharge cap
         self._battery_voltage = s.get("battery_voltage", self._battery_voltage)
