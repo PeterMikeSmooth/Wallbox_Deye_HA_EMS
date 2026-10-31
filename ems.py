@@ -20,7 +20,7 @@ import threading
 from datetime import datetime, timedelta
 
 import config
-from ha_api import HomeAssistantAPI
+from ha_api import HomeAssistantAPI, SensorUnavailable
 from wallbox_current import WallboxCurrent
 
 
@@ -1973,10 +1973,18 @@ def main() -> None:
 
     ha = HomeAssistantAPI(config.HA_URL, config.HA_TOKEN)
     ems = EMS(ha)
+    # Start of the current sensor outage (None while readings are fine) and
+    # when it was last logged: one line at the start, one every 10 min, one
+    # at the end — instead of a traceback every second.
+    unavailable_since = unavailable_logged = None
 
     while True:
         try:
             sensors = ha.read_all_sensors()
+            if unavailable_since is not None:
+                log.info("Sensors back after %.0f min — resuming",
+                         (time.monotonic() - unavailable_since) / 60)
+                unavailable_since = unavailable_logged = None
             log.debug(
                 "sensors: ev=%.0fW solar=%.0fW soc=%.0f%% batt_pwr=%.0fW "
                 "grid=%.0fW batt_v=%.1fV grid_v=%.1fV limit=%.0f%% prio=%.0f%% mode=%s "
@@ -1993,6 +2001,17 @@ def main() -> None:
         except KeyboardInterrupt:
             log.info("Shutting down (KeyboardInterrupt)")
             sys.exit(0)
+        except SensorUnavailable as exc:
+            # Nothing is written this tick: the wallbox and the inverter keep
+            # their last setpoints until the readings come back.
+            now = time.monotonic()
+            if unavailable_since is None:
+                unavailable_since = unavailable_logged = now
+                log.warning("Sensor unavailable (%s) — skipping ticks until it is back", exc)
+            elif now - unavailable_logged >= 600:
+                unavailable_logged = now
+                log.warning("Still unavailable after %.0f min (%s)",
+                            (now - unavailable_since) / 60, exc)
         except Exception:
             log.exception("Error in main loop — will retry next tick")
 

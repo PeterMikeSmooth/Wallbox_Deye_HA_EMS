@@ -63,6 +63,20 @@ GW_CAR_CONNECTED = "binary_sensor.wallbox_192_168_8_188_car_connected"
 GW_CHARGER_STATUS = "sensor.wallbox_192_168_8_188_charger_status"
 
 
+class SensorUnavailable(ValueError):
+    """A sensor the tick needs has no reading (``unavailable`` / ``unknown``).
+
+    Typically the Deye's Solarman logger dropping off the LAN: every Deye
+    entity goes ``unavailable`` at once, for minutes or more.  Not a bug, so
+    the main loop logs it once instead of a traceback every second.
+    """
+
+    def __init__(self, entity_id: str, state):
+        super().__init__(f"{entity_id} is {state!r}")
+        self.entity_id = entity_id
+        self.state = state
+
+
 class HomeAssistantAPI:
     """Thin wrapper around the HA REST API."""
 
@@ -86,6 +100,8 @@ class HomeAssistantAPI:
         )
         resp.raise_for_status()
         value = resp.json()["state"]
+        if value in self._NO_STATE:
+            raise SensorUnavailable(entity_id, value)
         return float(value)
 
     def get_text_state(self, entity_id: str) -> str:
