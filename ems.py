@@ -69,7 +69,7 @@ DISCHARGE_RECONCILE_GRACE_S = 240    # let the inverter reflect a write before j
 DISCHARGE_RECONCILE_SAMPLES = 2      # consecutive divergent reads before re-writing
 # Phantom SOC: when the Dawnice BMS falls asleep (cell under 3.15 V at rest, no
 # current) the Deye loses its CAN data for ~10 s and reports 99-100 % until it
-# wakes the BMS up again (every ~5 min on 2026-10-30, 01:56-18:11 UTC).
+# wakes the BMS up again (every ~5 min on 2026-10-30, 00:56-18:11 UTC).
 SOC_GLITCH_JUMP_PCT = 20   # a real SOC never moves this much between two reads
 SOC_GLITCH_HOLD_S = 60     # ...a jump that lasts longer is accepted as real
 
