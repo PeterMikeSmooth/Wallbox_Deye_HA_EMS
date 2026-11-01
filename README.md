@@ -86,6 +86,7 @@ Two recurring missions run under every mode:
 |--------|-------------|
 | `input_number.grid_ratio_value` | Share of EV power currently drawn from the grid (%) |
 | `input_number.range_needed_over_night` | Measured overnight battery drain (%), auto-computed |
+| `binary_sensor.ems_reserve_hp` | `on` while the HP reserve blocks the off-peak discharge; attributes `stockee_kwh`, `besoin_hp_kwh`, `plancher`, `fin_hc`, `prochaine_hc` (see [HP Reserve](#hp-reserve)) |
 
 > `batt_charge_prio` and `discharge_limit` are set **by hand only**: the EMS reads them and never writes them. `range_needed_over_night` is there to help choose them.
 
@@ -431,6 +432,11 @@ target, SOC vs. prio), and the restart with its reason.
 | `TESLA_SETTLE_AFTER_CUT_S` | 120 s | Meter settling time before a restart can be judged |
 | `TESLA_PAUSE_LOG_INTERVAL_S` | 300 s | Heartbeat log period while paused |
 | `TESLA_STATE_FILE` | `logs/ems_state.json` | Persisted pause flag |
+| `HP_RESERVE_CHECK_S` | 60 s | HP reserve evaluation period |
+| `HP_RESERVE_RELEASE_KWH` | 0.3 kWh | Hysteresis before releasing the HP reserve |
+| `BATTERY_USABLE_KWH` | 10.3 kWh | Battery energy per 100 % of SOC |
+| `NIGHT_HOUSE_LOAD_W` | 200 W | Low estimate of the house load without sun |
+| `SUN_COVERS_HOUSE_AFTER_RISE` | 1 h | Delay after sunrise before the sun covers the house |
 
 They are deliberately **module constants in `ems.py`**, not `config.py` entries: the Pi's
 `config.py` is gitignored and never refreshed by `git pull`, so a new key added here but missing
@@ -495,6 +501,29 @@ Two-phase state machine that measures how much the battery drains overnight. Inf
 
 - **WAIT_FOR_NIGHT** — on the falling edge of solar (dusk), capture `soc_dusk`. Later edges overwrite it, so the last crossing before 01:00 is the real sunset. At 01:00, lock it in.
 - **WAIT_FOR_DAYLIGHT** — on the first solar crossing above 100 W (sunrise), compute `range_needed = soc_dusk − soc_now` and publish it to `range_needed_over_night`.
+
+### HP Reserve
+
+The Deye never charges from the grid: only the sun refills the battery. When it is low on a dull
+day, it will reach its floor before the sun is back whatever the EMS does. Every kWh it gives in
+off-peak (0.166 €) is then a kWh it no longer gives in peak (0.216 €). So, once a minute during an
+off-peak window:
+
+```
+stored = (SOC − floor) × BATTERY_USABLE_KWH          floor = number.deye_battery_low_soc
+need   = NIGHT_HOUSE_LOAD_W × dark hours of the next peak block
+```
+
+The dark hours are those of the next peak block (end of this window → start of the next) outside
+`sunrise + 1 h → sunset`, from `sun.sun`. The 12:24–15:24 window is followed by 15:24–01:54
+(≈ 8.5 h of dark in November, 1.7 kWh); the night window by 06:54–12:24 (≈ 1.3 h, 0.25 kWh).
+200 W is a low estimate (≈ 5th percentile of the October evenings), so `stored ≤ need` means the
+floor will be reached before the next off-peak window.
+
+While `stored ≤ need` (released `HP_RESERVE_RELEASE_KWH` above it), the discharge setpoint is
+forced to 0 A in every state except STORAGE_ONLY, which asks the battery to fill the car. Charging is
+untouched, so the sun can still top it up. The reserve ends with the window; a failed reading
+releases it. The state is published to `binary_sensor.ems_reserve_hp`.
 
 ### Wallbox Override Protection
 

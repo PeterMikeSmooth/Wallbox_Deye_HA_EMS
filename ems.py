@@ -73,6 +73,20 @@ DISCHARGE_RECONCILE_SAMPLES = 2      # consecutive divergent reads before re-wri
 SOC_GLITCH_JUMP_PCT = 20   # a real SOC never moves this much between two reads
 SOC_GLITCH_HOLD_S = 60     # ...a jump that lasts longer is accepted as real
 
+# HP reserve (user request of 2026-11-01): during an off-peak window, when the
+# energy left above the floor is less than the house will surely draw in the
+# dark hours of the next peak block, the battery will reach its floor anyway
+# before the sun can recharge it (the Deye never charges from the grid).  It
+# then stops discharging in off-peak, still charges, and spends that energy in
+# peak instead: 0.05 €/kWh more (0.216 vs 0.166).
+HP_RESERVE_CHECK_S = 60
+HP_RESERVE_RELEASE_KWH = 0.3       # hysteresis: release only this far above the need
+BATTERY_USABLE_KWH = 10.3          # sensor.dawnice_capacite_kwh on 2026-11-01
+NIGHT_HOUSE_LOAD_W = 200           # house without EV, dusk -> 02:00: ~5th percentile of Oct 2026
+SUN_COVERS_HOUSE_AFTER_RISE = timedelta(hours=1)
+BATTERY_FLOOR_ENTITY = "number.deye_battery_low_soc"   # = the 6 program SOCs (dawnice/plancher.py)
+HP_RESERVE_SENSOR = "binary_sensor.ems_reserve_hp"
+
 
 # ---------------------------------------------------------------------------
 # SOLAR_ONLY Tesla pause (see README "Tesla solar pause")
@@ -237,6 +251,42 @@ def is_off_peak() -> bool:
     return False
 
 
+def off_peak_bounds(now: datetime) -> tuple[datetime, datetime] | None:
+    """(end of the current off-peak window, start of the next one), or None in peak."""
+    windows = []
+    for day in (-1, 0, 1, 2):
+        base = (now + timedelta(days=day)).replace(hour=0, minute=0, second=0, microsecond=0)
+        for (sh, sm), (eh, em) in config.OFF_PEAK_WINDOWS:
+            start = base.replace(hour=sh, minute=sm)
+            end = base.replace(hour=eh, minute=em)
+            if end <= start:
+                end += timedelta(days=1)
+            windows.append((start, end))
+    windows.sort()
+    for start, end in windows:
+        if start <= now < end:
+            return end, min(s for s, _ in windows if s >= end)
+    return None
+
+
+def dark_hours(start: datetime, end: datetime, next_rising: datetime,
+               next_setting: datetime) -> float:
+    """Hours of [start, end] the sun cannot cover the house.
+
+    Daylight runs from SUN_COVERS_HOUSE_AFTER_RISE after sunrise to sunset;
+    sun.sun only gives the next ones, so the neighbouring days are shifted by
+    24 h (a few minutes off, which is fine here).
+    """
+    rise = next_rising if next_rising < next_setting else next_rising - timedelta(days=1)
+    dark = (end - start).total_seconds()
+    for day in (-1, 0, 1, 2):
+        lo = max(start, rise + SUN_COVERS_HOUSE_AFTER_RISE + timedelta(days=day))
+        hi = min(end, next_setting + timedelta(days=day))
+        if hi > lo:
+            dark -= (hi - lo).total_seconds()
+    return dark / 3600
+
+
 # ---------------------------------------------------------------------------
 # EMS controller
 # ---------------------------------------------------------------------------
@@ -270,6 +320,8 @@ class EMS:
         self._battery_voltage = 52.0        # last known battery voltage
         self._soc_trusted = None            # last SOC that was not a phantom jump
         self._soc_jump_since = None         # monotonic ts of the first read of a jump
+        self._hp_reserve = False            # off-peak discharge blocked (see _update_hp_reserve)
+        self._hp_reserve_ts = 0.0           # monotonic ts of the last evaluation
         # Wallbox override detection
         self._wallbox_override_since = None  # timestamp when override first detected
         self._wallbox_override_retries = 0   # number of toggle retries attempted
@@ -372,6 +424,11 @@ class EMS:
         second is what got a write silently dropped on 2026-08-27, leaving the
         battery clamped at 5 A all night.
         """
+        # HP reserve: no discharge in off-peak, except in STORAGE_ONLY where
+        # the user asked for the battery to go into the car.
+        if self._hp_reserve and self.state != State.STORAGE_ONLY:
+            amps = 0
+
         # Global cap: apply MAX_DISCHARGE_POWER_W only when EV is charging
         # (long sustained discharge → inverter heating). Transient house loads are fine.
         if self.state != State.IDLE:
@@ -576,6 +633,76 @@ class EMS:
                     )
                 self._wallbox_override_since = None
                 self._wallbox_override_retries = 0
+
+    # -- HP reserve -----------------------------------------------------------
+
+    def _update_hp_reserve(self, s: dict) -> None:
+        """Keep the battery for peak hours when it will reach its floor anyway.
+
+        Evaluated once a minute, in off-peak only: the energy above the floor
+        is compared with what the house draws, at NIGHT_HOUSE_LOAD_W, during
+        the dark hours of the next peak block.  If it is not more, that block
+        empties the battery whatever happens, so every kWh not spent now is
+        spent in peak instead.  The sun can still charge it meanwhile.  A
+        reading that fails releases the reserve: the EMS falls back on its
+        usual behaviour.
+        """
+        now_m = time.monotonic()
+        if now_m - self._hp_reserve_ts < HP_RESERVE_CHECK_S:
+            return
+        self._hp_reserve_ts = now_m
+        now = datetime.now().astimezone()
+        bounds = off_peak_bounds(now)
+        hold, attrs = False, {}
+        if bounds is not None:
+            hc_end, next_hc = bounds
+            try:
+                floor = self.ha.get_state(BATTERY_FLOOR_ENTITY)
+                sun = self.ha.get_entity_safe(SUN_ENTITY) or {}
+                rising = datetime.fromisoformat(sun["attributes"]["next_rising"])
+                setting = datetime.fromisoformat(sun["attributes"]["next_setting"])
+            except Exception as exc:
+                log.warning("HP reserve: cannot read floor or sun (%s) — released", exc)
+            else:
+                stored = max(s["battery_soc"] - floor, 0) / 100 * BATTERY_USABLE_KWH
+                need = NIGHT_HOUSE_LOAD_W / 1000 * dark_hours(hc_end, next_hc, rising, setting)
+                margin = HP_RESERVE_RELEASE_KWH if self._hp_reserve else 0.0
+                hold = stored <= need + margin
+                attrs = {"stockee_kwh": round(stored, 2), "besoin_hp_kwh": round(need, 2),
+                         "plancher": floor, "fin_hc": hc_end.isoformat(timespec="minutes"),
+                         "prochaine_hc": next_hc.isoformat(timespec="minutes")}
+        if hold != self._hp_reserve:
+            self._hp_reserve = hold
+            if hold:
+                log.info("HP reserve ON: %.2f kWh above the %.0f %% floor, the house needs "
+                         "%.2f kWh in the dark from %s to %s — no discharge until %s",
+                         attrs["stockee_kwh"], attrs["plancher"], attrs["besoin_hp_kwh"],
+                         f"{hc_end:%H:%M}", f"{next_hc:%H:%M}", f"{hc_end:%H:%M}")
+                self._set_max_discharging(0, force=True)
+            else:
+                if bounds is None:
+                    why = "peak hours"
+                elif attrs:
+                    why = f"{attrs['stockee_kwh']:.2f} kWh stored > {attrs['besoin_hp_kwh']:.2f} kWh needed"
+                else:
+                    why = "no data"
+                log.info("HP reserve OFF: %s", why)
+                self._restore_discharge_policy()
+        try:
+            self.ha.publish_state(HP_RESERVE_SENSOR, "on" if hold else "off",
+                                  {"friendly_name": "EMS réserve HP", **attrs})
+        except Exception:
+            log.warning("Failed to publish %s", HP_RESERVE_SENSOR, exc_info=True)
+
+    def _restore_discharge_policy(self) -> None:
+        """Rewrite the setpoint of states that only set it on entry.
+
+        The others recompute it every tick.
+        """
+        if self.state == State.SOLAR_BOOSTED:
+            self._set_max_discharging(0, force=True)
+        elif self.state in (State.IDLE, State.SOLAR_ONLY):
+            self._set_max_discharging(config.DEFAULT_MAX_DISCHARGING_CURRENT_A, force=True)
 
     # -- overnight range tracking ---------------------------------------------
 
@@ -1726,6 +1853,7 @@ class EMS:
         """Called every fast-loop iteration with fresh sensor data *s*."""
 
         self._filter_soc(s)
+        self._update_hp_reserve(s)
 
         # Update battery voltage for global discharge cap
         self._battery_voltage = s.get("battery_voltage", self._battery_voltage)

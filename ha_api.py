@@ -390,6 +390,15 @@ class HomeAssistantAPI:
         )
         resp.raise_for_status()
 
+    def publish_state(self, entity_id: str, state: str, attributes: dict) -> None:
+        """Create or overwrite an entity owned by the script (lost at HA restart)."""
+        resp = self._session.post(
+            f"{self._base}/api/states/{entity_id}",
+            json={"state": state, "attributes": attributes},
+            timeout=10,
+        )
+        resp.raise_for_status()
+
     def notify(self, title: str, message: str, notification_id: str) -> None:
         """Raise a persistent notification in the HA UI."""
         resp = self._session.post(
