@@ -228,3 +228,6 @@ urbansolar/data/
 
 # Économie carburant : sessions de recharge horodatées, jamais sur GitHub
 voitures/data/
+
+# Plancher Dawnice : journal quotidien, jamais sur GitHub
+dawnice/data/

@@ -635,3 +635,19 @@ sudo cp chutes/systemd/ems-chutes.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ems-chutes.service
 journalctl -u ems-chutes -f
 ```
+
+### Dawnice battery dynamic floor (`dawnice/`)
+
+`dawnice/plancher.py` sets the battery discharge floor once a day (11:00), between **8 and 20 %**. Below 3.15 V per cell with no current, the Dawnice PACE BMS falls asleep: the Deye loses its CAN data and shows a phantom 99-100 % SOC for ~10 s before waking it up, every ~5 min (`ems.py` ignores these jumps, see `SOC_GLITCH_JUMP_PCT`). At the floor the Deye holds the SOC from the grid, so the BMS sees no current; whether it sleeps depends on the weakest cell's voltage, which varies with temperature, learned capacity and cell spread, hence a floor tuned on measured voltage.
+
+Each day, since the previous run (24 h at most):
+- **margin** = lowest cell at rest at the floor − 3.15 V, read from the BMS Bluetooth readings (`dawnice_ble.py` in the HA_AppleWatch repo, `~/.local/share/batterie_dawnice/ble_YYYY-MM.csv`);
+- **sleep episodes** = jumps of `sensor.deye_battery` from the floor to 95 % or more.
+
+An episode, or a margin under +10 mV: floor **+2 to +4 points** (about 15 mV per point near empty). A margin above +50 mV for 3 days in a row at the same floor, with no episode: floor **−1 point**. No visit to the floor: no change. The floor is written to the 6 time-slot SOCs and the Deye's Low SOC (shutdown stays at 6 %), at most once a day. If those 7 values differ (set by hand), nothing is written and the run fails. Journal in `dawnice/data/plancher.csv` (not committed), `sensor.ems_plancher_dawnice` pushed by POST /api/states, no notification. The battery name in power-flow-card-plus reads "min N%" from the same Deye numbers.
+
+```bash
+python3 dawnice/plancher.py --dry-run       # today's decision, nothing written
+sudo cp dawnice/systemd/ems-plancher-dawnice.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ems-plancher-dawnice.timer
+```

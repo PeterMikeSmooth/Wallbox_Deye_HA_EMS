@@ -1,0 +1,13 @@
+[Unit]
+Description=Plancher de décharge dynamique de la batterie Dawnice (8 à 20 %), écrit dans le Deye
+Documentation=file:/home/raspAutel/projects/Wallbox_Deye_HA_EMS/dawnice/plancher.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=raspAutel
+WorkingDirectory=/home/raspAutel/projects/Wallbox_Deye_HA_EMS/dawnice
+ExecStart=/usr/bin/python3 /home/raspAutel/projects/Wallbox_Deye_HA_EMS/dawnice/plancher.py
+# Jamais critique : en cas d'échec, le plancher reste tel quel jusqu'au lendemain.
+TimeoutStartSec=600

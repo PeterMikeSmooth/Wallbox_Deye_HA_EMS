@@ -1,0 +1,10 @@
+[Unit]
+Description=Plancher de décharge dynamique de la batterie Dawnice, chaque jour à 11:00
+
+[Timer]
+OnCalendar=*-*-* 11:00:00
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
