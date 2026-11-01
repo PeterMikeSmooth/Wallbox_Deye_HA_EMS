@@ -390,6 +390,16 @@ class HomeAssistantAPI:
         )
         resp.raise_for_status()
 
+    def get_hourly_forecast(self, entity_id: str) -> list[dict]:
+        """weather.get_forecasts, hourly: [{datetime, condition, ...}]."""
+        resp = self._session.post(
+            f"{self._base}/api/services/weather/get_forecasts?return_response",
+            json={"entity_id": entity_id, "type": "hourly"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["service_response"][entity_id]["forecast"]
+
     def publish_state(self, entity_id: str, state: str, attributes: dict) -> None:
         """Create or overwrite an entity owned by the script (lost at HA restart)."""
         resp = self._session.post(

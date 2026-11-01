@@ -86,7 +86,7 @@ Two recurring missions run under every mode:
 |--------|-------------|
 | `input_number.grid_ratio_value` | Share of EV power currently drawn from the grid (%) |
 | `input_number.range_needed_over_night` | Measured overnight battery drain (%), auto-computed |
-| `binary_sensor.ems_reserve_hp` | `on` while the HP reserve blocks the off-peak discharge; attributes `stockee_kwh`, `besoin_hp_kwh`, `plancher`, `fin_hc`, `prochaine_hc` (see [HP Reserve](#hp-reserve)) |
+| `binary_sensor.ems_reserve_hp` | `on` while the HP reserve blocks the off-peak discharge; attributes `stockee_kwh`, `besoin_hp_kwh`, `plancher`, `fin_hc`, `recharge_solaire` (see [HP Reserve](#hp-reserve)) |
 
 > `batt_charge_prio` and `discharge_limit` are set **by hand only**: the EMS reads them and never writes them. `range_needed_over_night` is there to help choose them.
 
@@ -437,6 +437,9 @@ target, SOC vs. prio), and the restart with its reason.
 | `BATTERY_USABLE_KWH` | 10.3 kWh | Battery energy per 100 % of SOC |
 | `NIGHT_HOUSE_LOAD_W` | 200 W | Low estimate of the house load without sun |
 | `SUN_COVERS_HOUSE_AFTER_RISE` | 1 h | Delay after sunrise before the sun covers the house |
+| `WEATHER_ENTITY` | Météo-France Callian | Hourly forecast used by the HP reserve |
+| `RECHARGE_SUNNY_RUN` | 2 h | Sun in a row that counts as a recharge |
+| `HP_RESERVE_HORIZON` | 48 h | Furthest the need looks for a recharge |
 
 They are deliberately **module constants in `ems.py`**, not `config.py` entries: the Pi's
 `config.py` is gitignored and never refreshed by `git pull`, so a new key added here but missing
@@ -504,26 +507,32 @@ Two-phase state machine that measures how much the battery drains overnight. Inf
 
 ### HP Reserve
 
-The Deye never charges from the grid: only the sun refills the battery. When it is low on a dull
-day, it will reach its floor before the sun is back whatever the EMS does. Every kWh it gives in
-off-peak (0.166 €) is then a kWh it no longer gives in peak (0.216 €). So, once a minute during an
+The Deye never charges from the grid: only the sun refills the battery. When it is low before a
+dull spell, it will reach its floor before the sun is back whatever the EMS does. Every kWh it gives
+in off-peak (0.166 €) is then a kWh it no longer gives in peak (0.216 €). So, once a minute during an
 off-peak window:
 
 ```
 stored = (SOC − floor) × BATTERY_USABLE_KWH          floor = number.deye_battery_low_soc
-need   = NIGHT_HOUSE_LOAD_W × dark hours of the next peak block
+need   = NIGHT_HOUSE_LOAD_W × peak hours without sun, from the end of this window to the next recharge
 ```
 
-The dark hours are those of the next peak block (end of this window → start of the next) outside
-`sunrise + 1 h → sunset`, from `sun.sun`. The 12:24–15:24 window is followed by 15:24–01:54
-(≈ 8.5 h of dark in November, 1.7 kWh); the night window by 06:54–12:24 (≈ 1.3 h, 0.25 kWh).
+The next recharge is the start of 2 h of sun in a row (`sunny` or `partlycloudy` in the
+Météo-France hourly forecast, between `sunrise + 1 h` and `sunset` from `sun.sun`). Peak hours
+before it count unless they are sunny daylight; off-peak hours do not (the reserve holds them).
+Dull weather thus stretches the need to the next sunny morning or beyond; with sun right after the
+window the need is small and the off-peak discharge goes on. The forecast is read every 30 min
+(`weather.get_forecasts`); without it the need falls back to the dark hours of the next peak block.
 200 W is a low estimate (≈ 5th percentile of the October evenings), so `stored ≤ need` means the
-floor will be reached before the next off-peak window.
+floor will be reached before the recharge.
+
+Example, 2026-11-01 at 12:24: 28 % for a 14 % floor = 1.44 kWh; rain until 21:00, sun on Monday from
+08:14 → 15:24–01:54 + 06:54–08:14 = 11.8 h, 2.37 kWh → no discharge until 15:24.
 
 While `stored ≤ need` (released `HP_RESERVE_RELEASE_KWH` above it), the discharge setpoint is
 forced to 0 A in every state except STORAGE_ONLY, which asks the battery to fill the car. Charging is
-untouched, so the sun can still top it up. The reserve ends with the window; a failed reading
-releases it. The state is published to `binary_sensor.ems_reserve_hp`.
+untouched, so the sun can still top it up. The reserve ends with the window; a failed floor or sun
+reading releases it. The state is published to `binary_sensor.ems_reserve_hp`.
 
 ### Wallbox Override Protection
 

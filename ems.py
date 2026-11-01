@@ -86,6 +86,18 @@ NIGHT_HOUSE_LOAD_W = 200           # house without EV, dusk -> 02:00: ~5th perce
 SUN_COVERS_HOUSE_AFTER_RISE = timedelta(hours=1)
 BATTERY_FLOOR_ENTITY = "number.deye_battery_low_soc"   # = the 6 program SOCs (dawnice/plancher.py)
 HP_RESERVE_SENSOR = "binary_sensor.ems_reserve_hp"
+# Weather (user request of 2026-11-01): a dull day will not recharge the
+# battery, so the need runs on to the next real recharge — 2 h of sun in a row
+# in the Météo-France hourly forecast — and also counts the cloudy daylight
+# hours.  A sunny afternoon or morning ends it early, and the off-peak
+# discharge is allowed.  No forecast: back to the dark hours of the next peak
+# block alone.
+WEATHER_ENTITY = "weather.meteo_france_forecast_for_city_callian_provence_alpes_cote_d_azur_83_fr_callian"
+WEATHER_REFRESH_S = 1800
+SUNNY_CONDITIONS = ("sunny", "partlycloudy")
+RECHARGE_SUNNY_RUN = timedelta(hours=2)
+HP_RESERVE_HORIZON = timedelta(hours=48)
+HP_RESERVE_STEP = timedelta(minutes=10)
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +245,9 @@ def sun_to_ev(s: dict) -> float:
     return s["ev_power"] - s["battery_power"] - s["grid_power"]
 
 
-def is_off_peak() -> bool:
-    """Return True if current time is in an off-peak window."""
-    now = datetime.now()
+def is_off_peak(now: datetime | None = None) -> bool:
+    """Return True if *now* (default: the current time) is in an off-peak window."""
+    now = now or datetime.now()
     minutes = now.hour * 60 + now.minute
     for start, end in config.OFF_PEAK_WINDOWS:
         sh, sm = start
@@ -287,6 +299,38 @@ def dark_hours(start: datetime, end: datetime, next_rising: datetime,
     return dark / 3600
 
 
+def hp_need_hours(start: datetime, next_rising: datetime, next_setting: datetime,
+                  forecast: list[tuple[datetime, str]]) -> tuple[float, datetime | None]:
+    """Peak hours without sun from *start* to the next recharge, and that recharge.
+
+    *forecast* is (start of validity, condition), sorted; each entry holds until
+    the next one.  A recharge is the start of RECHARGE_SUNNY_RUN of sunny
+    daylight; ``None`` when none is forecast within HP_RESERVE_HORIZON or the
+    forecast ends first.  Sunny daylight is not counted (the sun covers the
+    house), nor off-peak time (the reserve holds it then).
+    """
+    rise = next_rising if next_rising < next_setting else next_rising - timedelta(days=1)
+    days = [(rise + SUN_COVERS_HOUSE_AFTER_RISE + timedelta(days=d),
+             next_setting + timedelta(days=d)) for d in (-1, 0, 1, 2, 3)]
+    end = min(start + HP_RESERVE_HORIZON, forecast[-1][0] + timedelta(hours=1))
+    need, run_start, i, t = 0.0, None, 0, start
+    while t < end:
+        while i + 1 < len(forecast) and forecast[i + 1][0] <= t:
+            i += 1
+        sunny = (forecast[i][0] <= t and forecast[i][1] in SUNNY_CONDITIONS
+                 and any(lo <= t < hi for lo, hi in days))
+        if sunny:
+            run_start = run_start or t
+            if t + HP_RESERVE_STEP - run_start >= RECHARGE_SUNNY_RUN:
+                return need, run_start
+        else:
+            run_start = None
+            if not is_off_peak(t):
+                need += HP_RESERVE_STEP.total_seconds() / 3600
+        t += HP_RESERVE_STEP
+    return need, None
+
+
 # ---------------------------------------------------------------------------
 # EMS controller
 # ---------------------------------------------------------------------------
@@ -322,6 +366,8 @@ class EMS:
         self._soc_jump_since = None         # monotonic ts of the first read of a jump
         self._hp_reserve = False            # off-peak discharge blocked (see _update_hp_reserve)
         self._hp_reserve_ts = 0.0           # monotonic ts of the last evaluation
+        self._forecast = None               # [(start, condition)] from WEATHER_ENTITY
+        self._forecast_ts = None            # monotonic ts of that read
         # Wallbox override detection
         self._wallbox_override_since = None  # timestamp when override first detected
         self._wallbox_override_retries = 0   # number of toggle retries attempted
@@ -640,12 +686,13 @@ class EMS:
         """Keep the battery for peak hours when it will reach its floor anyway.
 
         Evaluated once a minute, in off-peak only: the energy above the floor
-        is compared with what the house draws, at NIGHT_HOUSE_LOAD_W, during
-        the dark hours of the next peak block.  If it is not more, that block
-        empties the battery whatever happens, so every kWh not spent now is
+        is compared with what the house draws, at NIGHT_HOUSE_LOAD_W, in the
+        peak hours without sun until the next recharge forecast (see
+        hp_need_hours).  If it is not more, the battery reaches its floor
+        before that recharge whatever happens, so every kWh not spent now is
         spent in peak instead.  The sun can still charge it meanwhile.  A
-        reading that fails releases the reserve: the EMS falls back on its
-        usual behaviour.
+        floor or sun reading that fails releases the reserve: the EMS falls
+        back on its usual behaviour.
         """
         now_m = time.monotonic()
         if now_m - self._hp_reserve_ts < HP_RESERVE_CHECK_S:
@@ -665,19 +712,26 @@ class EMS:
                 log.warning("HP reserve: cannot read floor or sun (%s) — released", exc)
             else:
                 stored = max(s["battery_soc"] - floor, 0) / 100 * BATTERY_USABLE_KWH
-                need = NIGHT_HOUSE_LOAD_W / 1000 * dark_hours(hc_end, next_hc, rising, setting)
+                forecast = self._read_forecast()
+                if forecast:
+                    hours, recharge = hp_need_hours(hc_end, rising, setting, forecast)
+                    until = recharge.isoformat(timespec="minutes") if recharge else "aucune prévue"
+                else:
+                    hours, until = dark_hours(hc_end, next_hc, rising, setting), "sans prévision"
+                need = NIGHT_HOUSE_LOAD_W / 1000 * hours
                 margin = HP_RESERVE_RELEASE_KWH if self._hp_reserve else 0.0
                 hold = stored <= need + margin
                 attrs = {"stockee_kwh": round(stored, 2), "besoin_hp_kwh": round(need, 2),
                          "plancher": floor, "fin_hc": hc_end.isoformat(timespec="minutes"),
-                         "prochaine_hc": next_hc.isoformat(timespec="minutes")}
+                         "recharge_solaire": until}
         if hold != self._hp_reserve:
             self._hp_reserve = hold
             if hold:
                 log.info("HP reserve ON: %.2f kWh above the %.0f %% floor, the house needs "
-                         "%.2f kWh in the dark from %s to %s — no discharge until %s",
+                         "%.2f kWh in peak hours without sun from %s (solar recharge: %s) "
+                         "— no discharge until %s",
                          attrs["stockee_kwh"], attrs["plancher"], attrs["besoin_hp_kwh"],
-                         f"{hc_end:%H:%M}", f"{next_hc:%H:%M}", f"{hc_end:%H:%M}")
+                         f"{hc_end:%H:%M}", until, f"{hc_end:%H:%M}")
                 self._set_max_discharging(0, force=True)
             else:
                 if bounds is None:
@@ -693,6 +747,21 @@ class EMS:
                                   {"friendly_name": "EMS réserve HP", **attrs})
         except Exception:
             log.warning("Failed to publish %s", HP_RESERVE_SENSOR, exc_info=True)
+
+    def _read_forecast(self) -> list[tuple[datetime, str]] | None:
+        """Hourly forecast, re-read every WEATHER_REFRESH_S; None if unreadable."""
+        now_m = time.monotonic()
+        if self._forecast_ts is not None and now_m - self._forecast_ts < WEATHER_REFRESH_S:
+            return self._forecast
+        self._forecast_ts = now_m
+        try:
+            raw = self.ha.get_hourly_forecast(WEATHER_ENTITY)
+            self._forecast = sorted((datetime.fromisoformat(f["datetime"]), f["condition"])
+                                    for f in raw) or None
+        except Exception as exc:
+            log.warning("HP reserve: no weather forecast (%s) — dark hours only", exc)
+            self._forecast = None
+        return self._forecast
 
     def _restore_discharge_policy(self) -> None:
         """Rewrite the setpoint of states that only set it on entry.
