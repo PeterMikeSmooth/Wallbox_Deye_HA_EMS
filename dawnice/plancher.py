@@ -28,12 +28,18 @@ erreur.
 Une ligne par jour dans `dawnice/data/plancher.csv`, capteur `sensor.ems_plancher_dawnice`
 poussé par POST /api/states. Pas de notification (choix de l'utilisateur, 01/11/2026) : le
 plancher se lit sur ce capteur et dans power-flow-card-plus (« min N% »).
+
+Les curseurs de l'EMS (`input_number.batt_charge_prio`, `input_number.discharge_limit`,
+réglés à la main) suivent le plancher : leur minimum dans HA lui est égal, et une valeur
+restée en dessous y est remontée. Au-dessus, rien n'est touché.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
+import json
 import logging
 import math
 import os
@@ -42,6 +48,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+import websockets
 
 BASE = Path(__file__).resolve().parent                  # .../dawnice
 # config.py (HA_URL, HA_TOKEN) vit à la racine, ce script dans dawnice/
@@ -62,6 +69,7 @@ COURANT_REPOS_A = 0.5
 FENETRE = timedelta(hours=24)
 SOC_DEYE = "sensor.deye_battery"
 REGLAGES = [f"number.deye_program_{i}_soc" for i in range(1, 7)] + ["number.deye_battery_low_soc"]
+CURSEURS = ["batt_charge_prio", "discharge_limit"]   # input_number de l'EMS, minimum = plancher
 RELEVES_BLE = Path("~/.local/share/batterie_dawnice").expanduser()
 JOURNAL = BASE / "data" / "plancher.csv"
 COLONNES = ["horodatage", "plancher_avant", "marge_min_mv", "cellule_min_n", "releves_repos",
@@ -171,6 +179,42 @@ def ecrit_plancher(session: requests.Session, valeur: int) -> None:
         log.info("%s = %d", entite, valeur)
 
 
+async def _ws(msgs: list[dict]) -> list:
+    async with websockets.connect(config.HA_URL.replace("http", "ws", 1) + "/api/websocket") as ws:
+        await ws.recv()
+        await ws.send(json.dumps({"type": "auth", "access_token": config.HA_TOKEN}))
+        await ws.recv()
+        out = []
+        for i, m in enumerate(msgs, 1):
+            await ws.send(json.dumps({"id": i, **m}))
+            rep = json.loads(await ws.recv())
+            if not rep.get("success"):
+                raise RuntimeError(f"{m['type']} : {rep.get('error')}")
+            out.append(rep["result"])
+        return out
+
+
+def aligne_curseurs(session: requests.Session, plancher: int) -> None:
+    """Minimum des curseurs de l'EMS = plancher ; valeur sous le plancher remontée."""
+    helpers = {h["id"]: h for h in asyncio.run(_ws([{"type": "input_number/list"}]))[0]}
+    maj = []
+    for c in CURSEURS:
+        h = helpers[c]
+        if round(h["min"]) != plancher:
+            maj.append({"type": "input_number/update", "input_number_id": c,
+                        **{k: v for k, v in h.items() if k != "id"}, "min": plancher})
+            log.info("input_number.%s : minimum %d → %d", c, round(h["min"]), plancher)
+    if maj:
+        asyncio.run(_ws(maj))
+    for c in CURSEURS:
+        entite = f"input_number.{c}"
+        if float(etat(session, entite)) < plancher:
+            resp = session.post(f"{config.HA_URL}/api/services/input_number/set_value",
+                                json={"entity_id": entite, "value": plancher}, timeout=30)
+            resp.raise_for_status()
+            log.info("%s remonté au plancher : %d", entite, plancher)
+
+
 def ajoute_journal(ligne: list) -> None:
     JOURNAL.parent.mkdir(parents=True, exist_ok=True)
     entete = not JOURNAL.exists() or JOURNAL.stat().st_size == 0
@@ -234,6 +278,7 @@ def main() -> int:
                        "episodes": episodes, "bornes": [PLANCHER_MIN, PLANCHER_MAX]},
     })
     resp.raise_for_status()
+    aligne_curseurs(session, nouveau)
     return 0
 
 

@@ -77,8 +77,8 @@ Two recurring missions run under every mode:
 |--------|-------------|-----------------|---------|
 | `input_select.ems_mode` | Active mode (see [Modes](#modes--states)) | 4 options | `SOLAR_ONLY` |
 | `input_number.batt_charge_limit` | Max SOC the battery is allowed to charge to | 50 – 100 % | 80 % |
-| `input_number.batt_charge_prio` | SOC target reached before solar surplus goes to the EV | 10 – 100 % | manual |
-| `input_number.discharge_limit` | SOC floor — battery won't discharge for the EV below this | 10 – 100 % | manual |
+| `input_number.batt_charge_prio` | SOC target reached before solar surplus goes to the EV | floor – 100 % | manual |
+| `input_number.discharge_limit` | SOC floor — battery won't discharge for the EV below this | floor – 100 % | manual |
 
 ### Status Outputs (written by the script, for dashboards)
 
@@ -645,6 +645,8 @@ Each day, since the previous run (24 h at most):
 - **sleep episodes** = jumps of `sensor.deye_battery` from the floor to 95 % or more.
 
 An episode, or a margin under +10 mV: floor **+2 to +4 points** (about 15 mV per point near empty). A margin above +50 mV for 3 days in a row at the same floor, with no episode: floor **−1 point**. No visit to the floor: no change. The floor is written to the 6 time-slot SOCs and the Deye's Low SOC (shutdown stays at 6 %), at most once a day. If those 7 values differ (set by hand), nothing is written and the run fails. Journal in `dawnice/data/plancher.csv` (not committed), `sensor.ems_plancher_dawnice` pushed by POST /api/states, no notification. The battery name in power-flow-card-plus reads "min N%" from the same Deye numbers.
+
+The EMS sliders `input_number.batt_charge_prio` and `input_number.discharge_limit` (set by hand) follow the floor: their HA minimum is set to it (WebSocket `input_number/update`), and a value left below it is raised to it. Values above the floor are left alone.
 
 ```bash
 python3 dawnice/plancher.py --dry-run       # today's decision, nothing written
