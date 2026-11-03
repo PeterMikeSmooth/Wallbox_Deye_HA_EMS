@@ -86,6 +86,9 @@ NIGHT_HOUSE_LOAD_W = 200           # house without EV, dusk -> 02:00: ~5th perce
 SUN_COVERS_HOUSE_AFTER_RISE = timedelta(hours=1)
 BATTERY_FLOOR_ENTITY = "number.deye_battery_low_soc"   # = the 6 program SOCs (dawnice/plancher.py)
 HP_RESERVE_SENSOR = "binary_sensor.ems_reserve_hp"
+# Set by hand (user request of 2026-11-03): holds the reserve in every
+# off-peak window, whatever the computation says, until switched off.
+HP_RESERVE_FORCE_ENTITY = "input_boolean.ems_verrouillage_hc"
 # Weather (user request of 2026-11-01): a dull day will not recharge the
 # battery, so the need runs on to the next real recharge — 2 h of sun in a row
 # in the Météo-France hourly forecast — and also counts the cloudy daylight
@@ -692,7 +695,8 @@ class EMS:
         before that recharge whatever happens, so every kWh not spent now is
         spent in peak instead.  The sun can still charge it meanwhile.  A
         floor or sun reading that fails releases the reserve: the EMS falls
-        back on its usual behaviour.
+        back on its usual behaviour.  HP_RESERVE_FORCE_ENTITY on holds it in
+        any case.
         """
         now_m = time.monotonic()
         if now_m - self._hp_reserve_ts < HP_RESERVE_CHECK_S:
@@ -700,16 +704,18 @@ class EMS:
         self._hp_reserve_ts = now_m
         now = datetime.now().astimezone()
         bounds = off_peak_bounds(now)
-        hold, attrs = False, {}
+        hold, forced, attrs = False, False, {}
         if bounds is not None:
             hc_end, next_hc = bounds
+            forced = self.ha.get_text_state_quiet(HP_RESERVE_FORCE_ENTITY) == "on"
             try:
                 floor = self.ha.get_state(BATTERY_FLOOR_ENTITY)
                 sun = self.ha.get_entity_safe(SUN_ENTITY) or {}
                 rising = datetime.fromisoformat(sun["attributes"]["next_rising"])
                 setting = datetime.fromisoformat(sun["attributes"]["next_setting"])
             except Exception as exc:
-                log.warning("HP reserve: cannot read floor or sun (%s) — released", exc)
+                log.warning("HP reserve: cannot read floor or sun (%s) — %s", exc,
+                            "held by hand" if forced else "released")
             else:
                 stored = max(s["battery_soc"] - floor, 0) / 100 * BATTERY_USABLE_KWH
                 forecast = self._read_forecast()
@@ -724,9 +730,15 @@ class EMS:
                 attrs = {"stockee_kwh": round(stored, 2), "besoin_hp_kwh": round(need, 2),
                          "plancher": floor, "fin_hc": hc_end.isoformat(timespec="minutes"),
                          "recharge_solaire": until}
+            hold = hold or forced
+            attrs["forcee"] = forced
         if hold != self._hp_reserve:
             self._hp_reserve = hold
-            if hold:
+            if hold and forced:
+                log.info("HP reserve ON: forced by hand (%s) — no discharge until %s",
+                         HP_RESERVE_FORCE_ENTITY, f"{hc_end:%H:%M}")
+                self._set_max_discharging(0, force=True)
+            elif hold:
                 log.info("HP reserve ON: %.2f kWh above the %.0f %% floor, the house needs "
                          "%.2f kWh in peak hours without sun from %s (solar recharge: %s) "
                          "— no discharge until %s",
@@ -736,7 +748,7 @@ class EMS:
             else:
                 if bounds is None:
                     why = "peak hours"
-                elif attrs:
+                elif "stockee_kwh" in attrs:
                     why = f"{attrs['stockee_kwh']:.2f} kWh stored > {attrs['besoin_hp_kwh']:.2f} kWh needed"
                 else:
                     why = "no data"

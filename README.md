@@ -79,6 +79,7 @@ Two recurring missions run under every mode:
 | `input_number.batt_charge_limit` | Max SOC the battery is allowed to charge to | 50 – 100 % | 80 % |
 | `input_number.batt_charge_prio` | SOC target reached before solar surplus goes to the EV | floor – 100 % | manual |
 | `input_number.discharge_limit` | SOC floor — battery won't discharge for the EV below this | floor – 100 % | manual |
+| `input_boolean.ems_verrouillage_hc` | Forces the [HP Reserve](#hp-reserve): no discharge in any off-peak window | on / off | off |
 
 ### Status Outputs (written by the script, for dashboards)
 
@@ -86,7 +87,7 @@ Two recurring missions run under every mode:
 |--------|-------------|
 | `input_number.grid_ratio_value` | Share of EV power currently drawn from the grid (%) |
 | `input_number.range_needed_over_night` | Measured overnight battery drain (%), auto-computed |
-| `binary_sensor.ems_reserve_hp` | `on` while the HP reserve blocks the off-peak discharge; attributes `stockee_kwh`, `besoin_hp_kwh`, `plancher`, `fin_hc`, `recharge_solaire` (see [HP Reserve](#hp-reserve)) |
+| `binary_sensor.ems_reserve_hp` | `on` while the HP reserve blocks the off-peak discharge; attributes `stockee_kwh`, `besoin_hp_kwh`, `plancher`, `fin_hc`, `recharge_solaire`, `forcee` (see [HP Reserve](#hp-reserve)) |
 
 > `batt_charge_prio` and `discharge_limit` are set **by hand only**: the EMS reads them and never writes them. `range_needed_over_night` is there to help choose them.
 
@@ -533,6 +534,10 @@ While `stored ≤ need` (released `HP_RESERVE_RELEASE_KWH` above it), the discha
 forced to 0 A in every state except STORAGE_ONLY, which asks the battery to fill the car. Charging is
 untouched, so the sun can still top it up. The reserve ends with the window; a failed floor or sun
 reading releases it. The state is published to `binary_sensor.ems_reserve_hp`.
+
+`input_boolean.ems_verrouillage_hc` (« Verrouillage HC », set by hand) holds the reserve in every
+off-peak window whatever the computation, until switched off; it is read once a minute, so it
+takes effect within a minute. It does nothing in peak hours, and STORAGE_ONLY stays exempt.
 
 ### Wallbox Override Protection
 
