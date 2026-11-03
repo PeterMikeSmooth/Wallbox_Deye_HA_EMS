@@ -438,6 +438,16 @@ class HomeAssistantAPI:
         )
         resp.raise_for_status()
 
+    def set_input_boolean(self, entity_id: str, on: bool) -> None:
+        """Turn an input_boolean on or off."""
+        service = "input_boolean/turn_on" if on else "input_boolean/turn_off"
+        resp = self._session.post(
+            f"{self._base}/api/services/{service}",
+            json={"entity_id": entity_id},
+            timeout=10,
+        )
+        resp.raise_for_status()
+
     def set_tesla_charge(self, on: bool) -> None:
         """Start (True) or stop (False) the Tesla charge via Tessie."""
         self.set_switch(SWITCH_TESLA_CHARGE, on)

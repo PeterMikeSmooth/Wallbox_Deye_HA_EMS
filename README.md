@@ -79,7 +79,7 @@ Two recurring missions run under every mode:
 | `input_number.batt_charge_limit` | Max SOC the battery is allowed to charge to | 50 – 100 % | 80 % |
 | `input_number.batt_charge_prio` | SOC target reached before solar surplus goes to the EV | floor – 100 % | manual |
 | `input_number.discharge_limit` | SOC floor — battery won't discharge for the EV below this | floor – 100 % | manual |
-| `input_boolean.ems_verrouillage_hc` | Forces the [HP Reserve](#hp-reserve): no discharge in any off-peak window | on / off | off |
+| `input_boolean.ems_verrouillage_hc` | Forces the [HP Reserve](#hp-reserve): no discharge in any off-peak window; switched off by the EMS at `batt_charge_limit` | on / off | off |
 
 ### Status Outputs (written by the script, for dashboards)
 
@@ -535,9 +535,13 @@ forced to 0 A in every state except STORAGE_ONLY, which asks the battery to fill
 untouched, so the sun can still top it up. The reserve ends with the window; a failed floor or sun
 reading releases it. The state is published to `binary_sensor.ems_reserve_hp`.
 
-`input_boolean.ems_verrouillage_hc` (« Verrouillage HC », set by hand) holds the reserve in every
-off-peak window whatever the computation, until switched off; it is read once a minute, so it
-takes effect within a minute. It does nothing in peak hours, and STORAGE_ONLY stays exempt.
+`input_boolean.ems_verrouillage_hc` (« EMS verrouillage HC », toggled by a long press on the battery
+of the power-flow card) holds the reserve in every off-peak window whatever the computation; it is
+read once a minute, so it takes effect within a minute. It does nothing in peak hours, and
+STORAGE_ONLY stays exempt. It stays on until switched off by hand, or by the EMS once the battery
+is back at `batt_charge_limit` (the sun has returned) for `HP_LOCK_RESET_CONFIRM_S` (5 min, so a
+phantom SOC cannot do it) — only after a reading below the limit, so a lock set on a full battery
+is not undone at once.
 
 ### Wallbox Override Protection
 

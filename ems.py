@@ -87,8 +87,13 @@ SUN_COVERS_HOUSE_AFTER_RISE = timedelta(hours=1)
 BATTERY_FLOOR_ENTITY = "number.deye_battery_low_soc"   # = the 6 program SOCs (dawnice/plancher.py)
 HP_RESERVE_SENSOR = "binary_sensor.ems_reserve_hp"
 # Set by hand (user request of 2026-11-03): holds the reserve in every
-# off-peak window, whatever the computation says, until switched off.
+# off-peak window, whatever the computation says, until switched off — by
+# hand, or by the EMS once the battery is back at batt_charge_limit: the sun
+# has returned.  A full battery must last HP_LOCK_RESET_CONFIRM_S (a phantom
+# SOC can pass the glitch filter), and must follow a reading below the limit
+# (a lock set on a full battery is not undone at once).
 HP_RESERVE_FORCE_ENTITY = "input_boolean.ems_verrouillage_hc"
+HP_LOCK_RESET_CONFIRM_S = 300
 # Weather (user request of 2026-11-01): a dull day will not recharge the
 # battery, so the need runs on to the next real recharge — 2 h of sun in a row
 # in the Météo-France hourly forecast — and also counts the cloudy daylight
@@ -369,6 +374,8 @@ class EMS:
         self._soc_jump_since = None         # monotonic ts of the first read of a jump
         self._hp_reserve = False            # off-peak discharge blocked (see _update_hp_reserve)
         self._hp_reserve_ts = 0.0           # monotonic ts of the last evaluation
+        self._hp_lock_armed = False         # hand lock seen below batt_charge_limit
+        self._hp_lock_full_since = None     # monotonic ts the locked battery reached it
         self._forecast = None               # [(start, condition)] from WEATHER_ENTITY
         self._forecast_ts = None            # monotonic ts of that read
         # Wallbox override detection
@@ -696,7 +703,7 @@ class EMS:
         spent in peak instead.  The sun can still charge it meanwhile.  A
         floor or sun reading that fails releases the reserve: the EMS falls
         back on its usual behaviour.  HP_RESERVE_FORCE_ENTITY on holds it in
-        any case.
+        any case (see _hp_lock).
         """
         now_m = time.monotonic()
         if now_m - self._hp_reserve_ts < HP_RESERVE_CHECK_S:
@@ -704,10 +711,10 @@ class EMS:
         self._hp_reserve_ts = now_m
         now = datetime.now().astimezone()
         bounds = off_peak_bounds(now)
-        hold, forced, attrs = False, False, {}
+        forced = self._hp_lock(s)
+        hold, attrs = False, {}
         if bounds is not None:
             hc_end, next_hc = bounds
-            forced = self.ha.get_text_state_quiet(HP_RESERVE_FORCE_ENTITY) == "on"
             try:
                 floor = self.ha.get_state(BATTERY_FLOOR_ENTITY)
                 sun = self.ha.get_entity_safe(SUN_ENTITY) or {}
@@ -759,6 +766,35 @@ class EMS:
                                   {"friendly_name": "EMS réserve HP", **attrs})
         except Exception:
             log.warning("Failed to publish %s", HP_RESERVE_SENSOR, exc_info=True)
+
+    def _hp_lock(self, s: dict) -> bool:
+        """State of the hand lock, switched off once the battery is full again."""
+        if self.ha.get_text_state_quiet(HP_RESERVE_FORCE_ENTITY) != "on":
+            self._hp_lock_armed = False
+            self._hp_lock_full_since = None
+            return False
+        soc, limit = s["battery_soc"], s["batt_charge_limit"]
+        if soc < limit:
+            self._hp_lock_armed = True
+            self._hp_lock_full_since = None
+            return True
+        if not self._hp_lock_armed:
+            return True
+        now_m = time.monotonic()
+        if self._hp_lock_full_since is None:
+            self._hp_lock_full_since = now_m
+        if now_m - self._hp_lock_full_since < HP_LOCK_RESET_CONFIRM_S:
+            return True
+        try:
+            self.ha.set_input_boolean(HP_RESERVE_FORCE_ENTITY, False)
+        except Exception:
+            log.warning("Failed to release %s", HP_RESERVE_FORCE_ENTITY, exc_info=True)
+            return True
+        log.info("HC lock released: SOC %.0f %% has reached batt_charge_limit (%.0f %%)",
+                 soc, limit)
+        self._hp_lock_armed = False
+        self._hp_lock_full_since = None
+        return False
 
     def _read_forecast(self) -> list[tuple[datetime, str]] | None:
         """Hourly forecast, re-read every WEATHER_REFRESH_S; None if unreadable."""
