@@ -693,7 +693,7 @@ Each day, since the previous run (24 h at most):
 
 An episode, or a margin under +10 mV: floor **+2 to +4 points** (about 15 mV per point near empty). A margin above +50 mV for 3 days in a row at the same floor, with no episode: floor **−1 point**. No visit to the floor: no change. The floor is written to the 6 time-slot SOCs and the Deye's Low SOC (shutdown stays at 6 %), at most once a day. If those 7 values differ (set by hand), nothing is written and the run fails. Journal in `dawnice/data/plancher.csv` (not committed), `sensor.ems_plancher_dawnice` pushed by POST /api/states, no notification. The battery name in power-flow-card-plus reads "min N%" from the same Deye numbers.
 
-The EMS sliders `input_number.batt_charge_prio` and `input_number.discharge_limit` (set by hand) follow the floor: their HA minimum is set to it (WebSocket `input_number/update`), and a value left below it is raised to it. Values above the floor are left alone.
+The EMS sliders `input_number.batt_charge_prio` and `input_number.discharge_limit` (set by hand) follow the floor: their HA minimum is set to it (WebSocket `input_number/update`), a value left below it is raised to it, and a value sitting exactly on the previous floor follows it down. Other values above the floor are left alone.
 
 ```bash
 python3 dawnice/plancher.py --dry-run       # today's decision, nothing written

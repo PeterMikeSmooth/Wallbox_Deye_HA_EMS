@@ -30,8 +30,9 @@ poussé par POST /api/states. Pas de notification (choix de l'utilisateur, 01/11
 plancher se lit sur ce capteur et dans power-flow-card-plus (« min N% »).
 
 Les curseurs de l'EMS (`input_number.batt_charge_prio`, `input_number.discharge_limit`,
-réglés à la main) suivent le plancher : leur minimum dans HA lui est égal, et une valeur
-restée en dessous y est remontée. Au-dessus, rien n'est touché.
+réglés à la main) suivent le plancher : leur minimum dans HA lui est égal, une valeur restée
+en dessous y est remontée, et une valeur posée pile sur l'ancien plancher le suit quand il
+descend. Au-dessus, rien n'est touché.
 """
 
 from __future__ import annotations
@@ -195,8 +196,10 @@ async def _ws(msgs: list[dict]) -> list:
 
 
 def aligne_curseurs(session: requests.Session, plancher: int) -> None:
-    """Minimum des curseurs de l'EMS = plancher ; valeur sous le plancher remontée."""
+    """Minimum des curseurs de l'EMS = plancher ; valeur sous le plancher remontée, valeur
+    posée sur l'ancien plancher descendue avec lui."""
     helpers = {h["id"]: h for h in asyncio.run(_ws([{"type": "input_number/list"}]))[0]}
+    anciens = {c: round(helpers[c]["min"]) for c in CURSEURS}
     maj = []
     for c in CURSEURS:
         h = helpers[c]
@@ -208,11 +211,17 @@ def aligne_curseurs(session: requests.Session, plancher: int) -> None:
         asyncio.run(_ws(maj))
     for c in CURSEURS:
         entite = f"input_number.{c}"
-        if float(etat(session, entite)) < plancher:
-            resp = session.post(f"{config.HA_URL}/api/services/input_number/set_value",
-                                json={"entity_id": entite, "value": plancher}, timeout=30)
-            resp.raise_for_status()
-            log.info("%s remonté au plancher : %d", entite, plancher)
+        valeur = float(etat(session, entite))
+        if valeur < plancher:
+            raison = "remonté au plancher"
+        elif plancher < anciens[c] and round(valeur) == anciens[c]:
+            raison = f"descendu avec le plancher (était sur l'ancien, {anciens[c]})"
+        else:
+            continue
+        resp = session.post(f"{config.HA_URL}/api/services/input_number/set_value",
+                            json={"entity_id": entite, "value": plancher}, timeout=30)
+        resp.raise_for_status()
+        log.info("%s %s : %d", entite, raison, plancher)
 
 
 def ajoute_journal(ligne: list) -> None:
