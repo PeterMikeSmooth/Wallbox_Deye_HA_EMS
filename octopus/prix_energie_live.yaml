@@ -447,9 +447,12 @@ template:
           {% set p = states('sensor.deye_microinverter_power') | float(0) %}
           {% set p = p if p > 15 else 0 %}
           {% set b = states('sensor.deye_battery_power') | float(0) %}
-          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+          {% set mn = now().hour * 60 + now().minute %}
+          {# secours si l'intégration Octopus ne répond pas : HC 1h54-6h54 et 12h24-15h24, 16,56 / 21,6 c #}
+          {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
           {% set pi = states('input_number.prix_rachat_surplus') | float(0) %}
           {% set abo_kwh = states('input_number.cout_abonnement_rachat') | float(0) %}
           {% set abo_h = states('sensor.urban_abonnement_estime') | float(0) / 8760 %}
@@ -470,9 +473,12 @@ template:
           {% set p = states('sensor.deye_microinverter_power') | float(0) %}
           {% set p = p if p > 15 else 0 %}
           {% set b = states('sensor.deye_battery_power') | float(0) %}
-          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+          {% set mn = now().hour * 60 + now().minute %}
+          {# secours si l'intégration Octopus ne répond pas : HC 1h54-6h54 et 12h24-15h24, 16,56 / 21,6 c #}
+          {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
           {% set pi = states('input_number.prix_rachat_surplus') | float(0) %}
           {% set abo_kwh = states('input_number.cout_abonnement_rachat') | float(0) %}
           {% set abo_h = states('sensor.urban_abonnement_estime') | float(0) / 8760 %}
