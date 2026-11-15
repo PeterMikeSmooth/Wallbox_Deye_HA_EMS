@@ -210,7 +210,8 @@ def recharges_ioniq_dehors(a):
         return
     borne = [(dt.datetime.fromisoformat(s["last_changed"]).astimezone(TZ), float(s["state"]))
              for s in h.get(PAR_VOITURE["ioniq"], []) if s["state"] not in ("unknown", "unavailable")]
-    serie = lambda e: [(dt.datetime.fromisoformat(s["last_changed"]).astimezone(TZ), s["state"]) for s in h[e]]
+    serie = lambda e: [(dt.datetime.fromisoformat(s["last_changed"]).astimezone(TZ), s["state"]) for s in h[e]
+                       if s["state"] not in ("unknown", "unavailable")]
     lieu, prise, soc = serie("device_tracker.moniq_location"), serie("binary_sensor.moniq_ev_battery_plug"), \
         [(t, float(s)) for t, s in serie("sensor.moniq_ev_battery_level") if s not in ("unknown", "unavailable")]
     def a_t(ser, t):
@@ -218,11 +219,17 @@ def recharges_ioniq_dehors(a):
         for tt, s in ser:
             if tt <= t: v = s
         return v
+    # capteurs calculés ailleurs : bornés (le rendement a affiché 2,2 % en nov. 2026 -> kWh × 40)
     try:
         cap = float(etat("sensor.moniq_capacite_utile_mesuree")["state"])
+    except (KeyError, ValueError):
+        cap = 43.0
+    try:
         rdt = float(etat("sensor.moniq_rendement_charge_mesure")["state"]) / 100
     except (KeyError, ValueError):
-        cap, rdt = 43.0, 0.9
+        rdt = 0.9
+    cap = cap if 20 <= cap <= 60 else 43.0
+    rdt = rdt if 0.75 <= rdt <= 1.0 else 0.9
     # sessions branchées ; une débranche de moins de 30 min (souvent un trou du cloud) ne coupe pas
     sessions, debut, coupe = [], None, None
     for t, s in prise + [(fin + dt.timedelta(hours=1), "fin")]:
@@ -246,6 +253,25 @@ def recharges_ioniq_dehors(a):
                         a.setdefault("ioniq_dehors", {})[debut.isoformat(timespec="minutes")] = {
                             "fin": t.isoformat(timespec="minutes"), "soc": [pts[0], max(pts)],
                             "kwh": round(gain / 100 * cap / rdt, 2), "lieu": a_t(lieu, debut)}
+    fusionne_sessions(a, cap, rdt)
+
+
+def fusionne_sessions(a, cap=43.0, rdt=0.9):
+    """Une même recharge peut être vue sous plusieurs débuts d'un passage horaire à l'autre :
+    les sessions qui se chevauchent n'en font qu'une (début le plus tôt, SOC du premier relevé)."""
+    ss = sorted(a.get("ioniq_dehors", {}).items())
+    out, cur_k, cur = {}, None, None
+    for k, v in ss:
+        if cur and k <= cur["fin"]:
+            cur["fin"] = max(cur["fin"], v["fin"])
+            cur["soc"] = [cur["soc"][0], max(cur["soc"][1], v["soc"][1])]
+        else:
+            if cur: out[cur_k] = cur
+            cur_k, cur = k, dict(v)
+    if cur: out[cur_k] = cur
+    for v in out.values():                       # kWh recalculés, plafonnés à une batterie pleine
+        v["kwh"] = round(min(max(v["soc"][1] - v["soc"][0], 0) / 100 * cap / rdt, cap / rdt), 2)
+    a["ioniq_dehors"] = out
 
 
 TESSIE_SESSIONS = None
@@ -376,6 +402,14 @@ def publie(jours):
                    f"Économie carburant {v.capitalize()} {lib}", detail[v])
         pousse(f"sensor.recharge_gratuite_{nom}", r(tot["gratuit_eur"]), f"Recharges gratuites {lib}",
                {"kwh": round(tot["gratuit_kwh"]), "par_voiture_kwh": {v: round(x.get("gratuit_kwh", 0)) for v, x in par.items()}})
+        try:
+            requests.post(config.HA_URL + f"/api/states/sensor.recharge_gratuite_kwh_{nom}", headers=HA, timeout=20, json={
+                "state": round(tot["gratuit_kwh"], 1), "attributes": {
+                    "unit_of_measurement": "kWh", "device_class": "energy", "state_class": "total",
+                    "friendly_name": f"Recharges gratuites {lib} (kWh)", "icon": "mdi:ev-station",
+                    "par_voiture_kwh": {v: round(x.get("gratuit_kwh", 0), 1) for v, x in par.items()}}})
+        except Exception as e:
+            print(f"  recharge_gratuite_kwh_{nom} : {e}")
         if nom == "vie":
             pousse("sensor.economie_carburant_nette_vie", r(tot["economie"] - BORNE), "Économie carburant nette (borne déduite)",
                    {"borne": BORNE})
