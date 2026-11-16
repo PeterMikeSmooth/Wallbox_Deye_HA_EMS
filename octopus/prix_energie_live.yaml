@@ -72,15 +72,15 @@ template:
         state_class: measurement
         availability: >
           {{ has_value('sensor.shellyem_34945478aee1_channel_1_power')
-             and has_value('sensor.shellyem_34945478aee1_channel_2_power')
-             and has_value('sensor.linky_25348914432154_off_peak_hours_rate')
-             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
+             and has_value('sensor.shellyem_34945478aee1_channel_2_power') }}
         state: >
           {% set grid_w = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
           {% set ev_w   = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
-          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+          {% set mn = now().hour * 60 + now().minute %}
+          {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
           {% set remb = tarif - 0.08 %}
           {% set import_kw = ([grid_w, 0] | max) / 1000 %}
           {% set k = states('input_number.rendement_borne') | float(0.9686)
@@ -91,24 +91,32 @@ template:
           heures_creuses: >
             {{ is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') }}
           tarif_en_cours: >
-            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-            {{ (states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) | round(4) }}
+            {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+            {% set mn = now().hour * 60 + now().minute %}
+            {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+            {{ (states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216)) | round(4) }}
           remboursement_ev: >
-            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-            {{ ((states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                 else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) - 0.08) | round(4) }}
+            {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+            {% set mn = now().hour * 60 + now().minute %}
+            {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+            {{ ((states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                 else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216)) - 0.08) | round(4) }}
           cout_reseau_h: >
             {% set grid_w = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
-            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-            {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                           else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+            {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+            {% set mn = now().hour * 60 + now().minute %}
+            {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+            {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                           else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
             {{ ((([grid_w, 0] | max) / 1000) * tarif) | round(3) }}
           gain_ev_h: >
             {% set ev_w = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
-            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-            {% set remb = (states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                           else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) - 0.08 %}
+            {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+            {% set mn = now().hour * 60 + now().minute %}
+            {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+            {% set remb = (states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                           else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216)) - 0.08 %}
             {{ (0 - (ev_w / 1000 if ev_w > 40 else 0) * remb) | round(3) }}
           puissance_reseau_w: >
             {{ states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) | round(0) }}
@@ -142,15 +150,15 @@ template:
         state_class: measurement
         availability: >
           {{ has_value('sensor.shellyem_34945478aee1_channel_1_power')
-             and has_value('sensor.shellyem_34945478aee1_channel_2_power')
-             and has_value('sensor.linky_25348914432154_off_peak_hours_rate')
-             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
+             and has_value('sensor.shellyem_34945478aee1_channel_2_power') }}
         state: >
           {% set grid_w = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
           {% set ev_w   = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
-          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+          {% set mn = now().hour * 60 + now().minute %}
+          {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
           {% set remb = tarif - 0.08 %}
           {% set import_kw = ([grid_w, 0] | max) / 1000 %}
           {% set k = states('input_number.rendement_borne') | float(0.9686)
@@ -164,13 +172,17 @@ template:
             {% set ev_w = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
             {{ ([([grid_w, 0] | max), (ev_w if ev_w > 40 else 0), 50] | max) | round(0) }}
           tarif_en_cours: >
-            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-            {{ (states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) | round(4) }}
+            {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+            {% set mn = now().hour * 60 + now().minute %}
+            {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+            {{ (states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216)) | round(4) }}
           remboursement_ev: >
-            {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-            {{ ((states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                 else states('sensor.linky_25348914432154_peak_hours_rate') | float(0)) - 0.08) | round(4) }}
+            {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+            {% set mn = now().hour * 60 + now().minute %}
+            {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+            {{ ((states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                 else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216)) - 0.08) | round(4) }}
           part_reseau_pct: >
             {% set grid_w = states('sensor.shellyem_34945478aee1_channel_1_power') | float(0) %}
             {% set ev_w = states('sensor.shellyem_34945478aee1_channel_2_power') | float(0) %}
@@ -211,13 +223,10 @@ template:
         unique_id: cout_energie_jour
         unit_of_measurement: "€"
         state_class: total
-        availability: >
-          {{ has_value('sensor.linky_25348914432154_off_peak_hours_rate')
-             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
         state: >
           {% set abo = state_attr('sensor.linky_25348914432154_latest_reading', 'cout_abonnement_euro') | float(0.628) %}
-          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
-          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) %}
+          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
           {% set ug = state_attr('sensor.grid_reseau_jour_hc', 'unit_of_measurement') %}
           {% set ue = state_attr('sensor.evse_voiture_jour_hc', 'unit_of_measurement') %}
           {% set kg = 1000 if ug == 'MWh' else (0.001 if ug == 'Wh' else 1) %}
@@ -236,13 +245,10 @@ template:
         unique_id: cout_energie_mois
         unit_of_measurement: "€"
         state_class: total
-        availability: >
-          {{ has_value('sensor.linky_25348914432154_off_peak_hours_rate')
-             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
         state: >
           {% set abo = state_attr('sensor.linky_25348914432154_latest_reading', 'cout_abonnement_euro') | float(0.628) %}
-          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
-          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) %}
+          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
           {% set ug = state_attr('sensor.grid_reseau_mois_hc', 'unit_of_measurement') %}
           {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
           {% set kg = 1000 if ug == 'MWh' else (0.001 if ug == 'Wh' else 1) %}
@@ -276,13 +282,10 @@ template:
         unit_of_measurement: "€"
         device_class: monetary
         state_class: total
-        availability: >
-          {{ has_value('sensor.linky_25348914432154_off_peak_hours_rate')
-             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
         state: >
           {% set abo = state_attr('sensor.linky_25348914432154_latest_reading', 'cout_abonnement_euro') | float(0.628) %}
-          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
-          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) %}
+          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
           {% set ug = state_attr('sensor.grid_reseau_mois_hc', 'unit_of_measurement') %}
           {% set kg = 1000 if ug == 'MWh' else (0.001 if ug == 'Wh' else 1) %}
           {% set g_hc = states('sensor.grid_reseau_mois_hc') | float(0) * kg %}
@@ -293,8 +296,8 @@ template:
             {{ ((state_attr('sensor.linky_25348914432154_latest_reading', 'cout_abonnement_euro') | float(0.628))
                 * now().day) | round(2) }}
           reseau: >
-            {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
-            {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+            {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) %}
+            {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
             {% set ug = state_attr('sensor.grid_reseau_mois_hc', 'unit_of_measurement') %}
             {% set kg = 1000 if ug == 'MWh' else (0.001 if ug == 'Wh' else 1) %}
             {{ ((states('sensor.grid_reseau_mois_hc') | float(0) * kg) * r_hc
@@ -305,12 +308,9 @@ template:
         unit_of_measurement: "€"
         device_class: monetary
         state_class: total
-        availability: >
-          {{ has_value('sensor.linky_25348914432154_off_peak_hours_rate')
-             and has_value('sensor.linky_25348914432154_peak_hours_rate') }}
         state: >
-          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
-          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) %}
+          {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
           {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
           {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
           {% set k = states('input_number.rendement_borne') | float(0.9688)
@@ -321,8 +321,8 @@ template:
         attributes:
           ecart_vs_octopus: >
             {% set o = states('sensor.octopus_bonus_attendu') | float(0) %}
-            {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) %}
-            {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+            {% set r_hc = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) %}
+            {% set r_hp = states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
             {% set ue = state_attr('sensor.evse_voiture_mois_hc', 'unit_of_measurement') %}
             {% set ke = 1000 if ue == 'MWh' else (0.001 if ue == 'Wh' else 1) %}
             {% set k = states('input_number.rendement_borne') | float(0.9688)
@@ -500,9 +500,11 @@ template:
           {% set p = states('sensor.deye_microinverter_power') | float(0) %}
           {% set p = p if p > 15 else 0 %}
           {% set b = states('sensor.deye_battery_power') | float(0) %}
-          {% set hc = is_state('binary_sensor.linky_25348914432154_off_peak_hours_active', 'on') %}
-          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0) if hc
-                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0) %}
+          {% set hc_etat = states('binary_sensor.linky_25348914432154_off_peak_hours_active') %}
+          {% set mn = now().hour * 60 + now().minute %}
+          {% set hc = hc_etat == 'on' if hc_etat in ['on', 'off'] else (114 <= mn < 414 or 744 <= mn < 924) %}
+          {% set tarif = states('sensor.linky_25348914432154_off_peak_hours_rate') | float(0.1656) if hc
+                         else states('sensor.linky_25348914432154_peak_hours_rate') | float(0.216) %}
           {% set pi = states('input_number.prix_rachat_surplus') | float(0) %}
           {% set abo_kwh = states('input_number.cout_abonnement_rachat') | float(0) %}
           {% set abo_h = states('sensor.urban_abonnement_estime') | float(0) / 8760 %}
